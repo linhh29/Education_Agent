@@ -1783,10 +1783,15 @@ class AlignmentTests(unittest.TestCase):
 
     def test_example_feedback_only_updates_preference(self):
         db = app.seed_db()
-        before = db["memoryItems"]["mem_seed_moon"]["confidence"]
+        db["memoryItems"]["moon"] = {
+            "id": "moon", "childId": app.DEFAULT_CHILD_ID, "type": "cognitive",
+            "concept": "月亮和天空", "status": "candidate", "confidence": 0.38,
+            "history": [], "sourceMessageIds": [], "updatedAt": app.now_iso(),
+        }
+        before = db["memoryItems"]["moon"]["confidence"]
         updates = [{"concept": "月亮和天空", "evidence": "", "effectiveAnalogy": "", "truthKernel": ""}]
         app.upsert_memory(db, app.DEFAULT_CHILD_ID, updates, ["u", "a"], "example", "为什么月亮跟着我？", {})
-        self.assertLessEqual(db["memoryItems"]["mem_seed_moon"]["confidence"], before + 0.02)
+        self.assertLessEqual(db["memoryItems"]["moon"]["confidence"], before + 0.02)
         self.assertTrue(any(item.get("type") == "preference" and item.get("concept") == "解释偏好：生活例子" for item in db["memoryItems"].values()))
 
     def test_danger_and_privacy_are_blocked(self):
@@ -2137,6 +2142,97 @@ class AlignmentTests(unittest.TestCase):
             for key in ("understandingScore", "questionDifficulty", "answerAdaptation", "independenceScore"):
                 self.assertGreaterEqual(point[key], 0)
                 self.assertLessEqual(point[key], 100)
+
+    def test_parent_feed_cards_quote_real_child_messages_and_mark_inference(self):
+        db = app.seed_db()
+        db["messages"] = {
+            "u1": {"id": "u1", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "恐龙都死掉了，看了会难过。", "createdAt": "2026-07-01T10:00:00"},
+            "u2": {"id": "u2", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "没人记得是不是就真的消失了？", "createdAt": "2026-07-20T10:00:00"},
+        }
+        db["memoryItems"]["association"] = {
+            "id": "association", "childId": app.DEFAULT_CHILD_ID, "type": "association", "status": "active",
+            "concept": "关于消失的跨期关切", "confidence": 0.62,
+            "evidence": "两段表达可能相关，需要家长核对。", "sourceMessageIds": ["u1", "u2"],
+            "updatedAt": "2026-07-20T10:01:00",
+        }
+        feed = app.build_parent_feed_cards(db, app.DEFAULT_CHILD_ID)
+        association = next(card for card in feed if card["type"] == "association")
+        self.assertEqual([quote["sourceId"] for quote in association["sourceQuotes"]], ["u1", "u2"])
+        self.assertEqual(association["evidenceLevel"], "待核对的推测")
+        self.assertIn("不是心理诊断", association["disclaimer"])
+
+    def test_curiosity_card_quotes_only_its_strongest_topic(self):
+        db = app.seed_db()
+        db["messages"] = {
+            "moon_1": {"id": "moon_1", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "月亮为什么会跟着我？", "createdAt": "2026-07-01T10:00:00"},
+            "moon_2": {"id": "moon_2", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "月亮为什么有时像小船？", "createdAt": "2026-07-01T10:01:00"},
+            "moon_3": {"id": "moon_3", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "星星为什么会眨眼？", "createdAt": "2026-07-01T10:02:00"},
+            "shadow": {"id": "shadow", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "下午的影子为什么变长？", "createdAt": "2026-07-01T10:03:00"},
+            "plant": {"id": "plant", "childId": app.DEFAULT_CHILD_ID, "role": "user", "text": "阳台的小花怎么喝水？", "createdAt": "2026-07-01T10:04:00"},
+        }
+        db["memoryItems"] = {}
+
+        curiosity = next(card for card in app.build_parent_feed_cards(db, app.DEFAULT_CHILD_ID) if card["type"] == "curiosity")
+
+        self.assertEqual(curiosity["title"], "最近在持续探索：太空/月亮")
+        self.assertEqual([quote["sourceId"] for quote in curiosity["sourceQuotes"]], ["moon_2", "moon_3"])
+        self.assertTrue(all("月亮" in quote["text"] or "星" in quote["text"] for quote in curiosity["sourceQuotes"]))
+
+    def test_parent_feed_cold_start_does_not_invent_child_quotes(self):
+        db = app.seed_db()
+        db["messages"] = {}
+        db["memoryItems"] = {}
+        feed = app.build_parent_feed_cards(db, app.DEFAULT_CHILD_ID)
+        self.assertEqual(len(feed), 1)
+        self.assertEqual(feed[0]["type"], "onboarding")
+        self.assertEqual(feed[0]["sourceQuotes"], [])
+
+    def test_showcase_import_is_isolated_and_idempotent(self):
+        db = app.seed_db()
+        db["messages"]["live_message"] = {"id": "live_message", "childId": "child_live", "role": "user", "text": "普通用户的问题"}
+        first = app.import_showcase_child(db)
+        second = app.import_showcase_child(db)
+        self.assertEqual(first["childId"], app.SHOWCASE_CHILD_ID)
+        self.assertEqual(second["counts"]["messages"], 2016)
+        self.assertEqual(db["profiles"][app.SHOWCASE_CHILD_ID]["nickname"], "小满")
+        self.assertEqual(len([item for item in db["messages"].values() if item.get("childId") == app.SHOWCASE_CHILD_ID]), 2016)
+        self.assertIn("live_message", db["messages"])
+        self.assertEqual(db["showcases"][app.SHOWCASE_CHILD_ID]["dialogueRounds"], 1008)
+        self.assertEqual(len([item for item in db["memoryItems"].values() if item.get("childId") == app.SHOWCASE_CHILD_ID and item.get("type") == "cognitive"]), 18)
+        self.assertEqual(len([item for item in db["memoryItems"].values() if item.get("childId") == app.SHOWCASE_CHILD_ID and item.get("type") == "preference"]), 6)
+        self.assertEqual(len([item for item in db["safetyEvents"].values() if item.get("childId") == app.SHOWCASE_CHILD_ID]), 3)
+
+    def test_complete_chat_memory_supports_pagination_search_and_evidence_context(self):
+        fixture = app.safe_json_load(app.SHOWCASE_DB_PATH)
+        page = app.chat_memory_page(fixture, app.DEFAULT_CHILD_ID, page=2, page_size=30)
+        self.assertEqual(page["total"], 2016)
+        self.assertEqual(page["page"], 2)
+        self.assertEqual(len(page["items"]), 30)
+        search = app.chat_memory_page(fixture, app.DEFAULT_CHILD_ID, query="打火机")
+        self.assertTrue(any("打火机" in item["text"] for item in search["items"]))
+        source_id = "showcase_u_19_13"
+        evidence = app.chat_memory_page(fixture, app.DEFAULT_CHILD_ID, source_ids=[source_id])
+        self.assertTrue(evidence["evidenceMode"])
+        self.assertEqual(evidence["matchedSourceIds"], [source_id])
+        self.assertTrue(any(item["id"] == source_id and item["isSourceEvidence"] for item in evidence["items"]))
+        self.assertGreaterEqual(len(evidence["items"]), 3)
+
+    def test_associative_triggers_and_validated_skill_enter_related_memory(self):
+        db = app.seed_db()
+        db["memoryItems"] = {
+            "association": {
+                "id": "association", "childId": app.DEFAULT_CHILD_ID, "type": "association", "status": "active",
+                "concept": "消失与被记得", "confidence": 0.61, "horizonTriggers": ["没人记得", "忘记"],
+            },
+            "skill": {
+                "id": "skill", "childId": app.DEFAULT_CHILD_ID, "type": "education_skill", "status": "validated",
+                "concept": "先观察再解释", "confidence": 0.9, "applicableTopics": ["影子", "光"], "reuseCount": 20,
+            },
+        }
+        association_results = app.related_memory_cards(db, app.DEFAULT_CHILD_ID, "如果没人记得它呢？")
+        skill_results = app.related_memory_cards(db, app.DEFAULT_CHILD_ID, "影子为什么会变长？")
+        self.assertIn("association", {item["type"] for item in association_results})
+        self.assertIn("education_skill", {item["type"] for item in skill_results})
 
 
 if __name__ == "__main__":

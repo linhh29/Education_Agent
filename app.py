@@ -31,7 +31,12 @@ from urllib.request import HTTPRedirectHandler
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "demo-db.json"
+_db_override = os.environ.get("EDUCATION_AGENT_DB", "").strip()
+DB_PATH = (Path(_db_override).expanduser() if _db_override else DATA_DIR / "demo-db.json")
+if not DB_PATH.is_absolute():
+    DB_PATH = (ROOT / DB_PATH).resolve()
+SHOWCASE_DB_PATH = DATA_DIR / "showcase-child-24days.json"
+SHOWCASE_CHILD_ID = "child_showcase_xiaoman"
 STATIC_DIR = ROOT / "static"
 MODEL_CONFIG_PATH = ROOT / "config" / "models.json"
 LOG_DIR = ROOT / "logs"
@@ -328,7 +333,7 @@ def safe_json_load(path: Path) -> Dict[str, Any]:
 
 
 def save_db(db: Dict[str, Any]) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = DB_PATH.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
@@ -389,45 +394,15 @@ def seed_db() -> Dict[str, Any]:
         },
         "conversations": {},
         "messages": {},
-        "memoryItems": {
-            "mem_seed_moon": {
-                "id": "mem_seed_moon",
-                "childId": DEFAULT_CHILD_ID,
-                "type": "cognitive",
-                "concept": "月亮和天空",
-                "status": "candidate",
-                "confidence": 0.38,
-                "evidence": "演示种子：对月亮为什么变化很感兴趣",
-                "effectiveAnalogy": "远处的大山和手电筒",
-                "sourceMessageIds": [],
-                "history": [],
-                "parentVerified": False,
-                "parentNote": "",
-                "updatedAt": t,
-            },
-            "mem_seed_pref": {
-                "id": "mem_seed_pref",
-                "childId": DEFAULT_CHILD_ID,
-                "type": "preference",
-                "concept": "解释偏好",
-                "status": "learning",
-                "confidence": 0.7,
-                "evidence": "家长建档：喜欢恐龙/太空/积木",
-                "effectiveAnalogy": "用积木、恐龙脚印、手电筒来解释",
-                "sourceMessageIds": [],
-                "history": [],
-                "parentVerified": True,
-                "parentNote": "",
-                "updatedAt": t,
-            },
-        },
+        "memoryItems": {},
         "parentFeedback": {},
         "safetyEvents": {},
+        "showcases": {},
     }
 
 
 def load_db() -> Dict[str, Any]:
-    DATA_DIR.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not DB_PATH.exists():
         db = seed_db()
         save_db(db)
@@ -436,7 +411,50 @@ def load_db() -> Dict[str, Any]:
 
 
 def profile_for(db: Dict[str, Any], child_id: str) -> Dict[str, Any]:
-    return db["profiles"].get(child_id) or db["profiles"].get(DEFAULT_CHILD_ID) or seed_db()["profiles"][DEFAULT_CHILD_ID]
+    existing = db.get("profiles", {}).get(child_id)
+    if existing:
+        return existing
+    base = seed_db()["profiles"][DEFAULT_CHILD_ID]
+    return {**base, "id": child_id}
+
+
+def import_showcase_child(db: Dict[str, Any]) -> Dict[str, Any]:
+    """Idempotently replace the isolated showcase child with the bundled fixture."""
+    if not SHOWCASE_DB_PATH.exists():
+        raise FileNotFoundError("示例数据库文件不存在，请先运行样例生成器。")
+    fixture = safe_json_load(SHOWCASE_DB_PATH)
+    source_profile = fixture.get("profiles", {}).get(DEFAULT_CHILD_ID)
+    if not isinstance(source_profile, dict):
+        raise ValueError("示例数据库缺少孩子档案")
+    for collection in ["profiles", "conversations", "messages", "memoryItems", "parentFeedback", "safetyEvents"]:
+        db.setdefault(collection, {})
+    db.setdefault("showcases", {})
+    db["profiles"].pop(SHOWCASE_CHILD_ID, None)
+    for collection in ["conversations", "messages", "memoryItems", "parentFeedback", "safetyEvents"]:
+        db[collection] = {
+            key: value for key, value in db[collection].items()
+            if value.get("childId") != SHOWCASE_CHILD_ID
+        }
+
+    profile = json.loads(json.dumps(source_profile, ensure_ascii=False))
+    profile["id"] = SHOWCASE_CHILD_ID
+    profile["showcase"] = True
+    db["profiles"][SHOWCASE_CHILD_ID] = profile
+    copied_counts: Dict[str, int] = {}
+    for collection in ["conversations", "messages", "memoryItems", "parentFeedback", "safetyEvents"]:
+        copied = 0
+        for key, value in fixture.get(collection, {}).items():
+            if value.get("childId") != DEFAULT_CHILD_ID:
+                continue
+            cloned = json.loads(json.dumps(value, ensure_ascii=False))
+            cloned["childId"] = SHOWCASE_CHILD_ID
+            db[collection][key] = cloned
+            copied += 1
+        copied_counts[collection] = copied
+    metadata = json.loads(json.dumps(fixture.get("showcase", {}), ensure_ascii=False))
+    metadata.update({"childId": SHOWCASE_CHILD_ID, "importedAt": now_iso(), "source": "bundled_showcase_fixture"})
+    db["showcases"][SHOWCASE_CHILD_ID] = metadata
+    return {"childId": SHOWCASE_CHILD_ID, "profile": profile, "counts": copied_counts, "showcase": metadata}
 
 
 def normalize_list(value: Any) -> List[str]:
@@ -2843,6 +2861,10 @@ def generation_system_prompt() -> str:
         "displayText必须逐组覆盖，每组优先自然使用preferredCoveragePhrases中的对应短语，不能只表达大概主题。"
         "activeCausalChain是本轮有序因果检查表；非空时必须按给定顺序讲完每一步，不能从起因直接跳到结论。"
         "最终回答必须由你本轮重新组织生成，不能假装读取了本地模板，也不能输出预制台词。"
+        "trustedMemory只表示经过门禁的已知概念；companionMemory是与本轮可能相关的过往情景，adaptationPolicy是孩子曾经给出的表达反馈，validatedEducationSkills是已验证可复用的教学策略。"
+        "这些长期线索只能改善衔接方式和解释策略，不能覆盖questionPlan中的事实。只在自然相关时轻量使用，不要逐条复述记忆，不要说‘我一直监控你’，不要诱导孩子透露秘密、住址、学校或其他隐私。"
+        "companionMemory含推测时必须保持不确定；可以用‘这让我想到你以前问过……’自然衔接，但不能把关联说成对孩子心理或性格的结论。"
+        "adaptationPolicy或validatedEducationSkills非空时，优先遵循其中与本轮模式不冲突的短句、先观察后解释、复述验证等策略；若与安全或事实契约冲突，以安全和事实契约为准。"
         "why反馈必须基于truthKernel和causalChainByMode补充上一轮没有讲出的下一层原因；不能只把上一轮的‘因为’换个位置再说一次。"
         "回答顺序：先直接回答，再用两三句连贯的话讲清因果；必要时加一个温和追问。输出应像自然口语段落，短句也必须表达完整关系。严禁连续输出‘几个字。几个字。’式碎片句。"
         "必须严格执行alignmentContract中的activityMode、minAnswerChars、minSentences和modeInstruction，但不能用重复句或空话凑长度。"
@@ -3116,6 +3138,9 @@ def _run_child_alignment_workflow(profile: Dict[str, Any], user_text: str, feedb
     contract = child_level_alignment(profile, feedback=feedback, related_cards=related_cards, activity_mode=activity_mode)
     model_contract = {key: value for key, value in contract.items() if key != "anchors"}
     trusted_memory = [card for card in related_cards if memory_card_is_trusted(card)]
+    preference_memory = [card for card in related_cards if card.get("type") == "preference"]
+    associative_memory = [card for card in related_cards if card.get("type") in {"episode", "association", "inference"}]
+    education_skills = [card for card in related_cards if card.get("type") == "education_skill" and card.get("status") in {"active", "known", "validated"}]
     request_payload = {
         "childContext": {
             "age": profile.get("age", 5),
@@ -3164,6 +3189,9 @@ def _run_child_alignment_workflow(profile: Dict[str, Any], user_text: str, feedb
         },
         "alignmentContract": model_contract,
         "trustedMemory": [{"concept": card.get("concept"), "status": card.get("status"), "parentVerified": bool(card.get("parentVerified"))} for card in trusted_memory[:4]],
+        "companionMemory": [{"concept": card.get("concept"), "evidence": normalize_optional_text(card.get("evidence"), 180), "relevanceRule": "只在与本轮问题自然相关时使用，不向孩子宣称系统掌握了隐私。"} for card in associative_memory[:2]],
+        "adaptationPolicy": [{"preference": card.get("concept"), "evidence": normalize_optional_text(card.get("evidence"), 160), "strategy": normalize_optional_text(card.get("strategy") or card.get("effectiveAnalogy"), 160)} for card in preference_memory[:2]],
+        "validatedEducationSkills": [{"name": card.get("concept"), "version": card.get("version", "1"), "instruction": normalize_optional_text(card.get("strategy"), 200), "validation": normalize_optional_text(card.get("validationSummary"), 120)} for card in education_skills[:2]],
     }
     answer_model_attempts = 0
     stage_started = time.perf_counter()
@@ -3743,14 +3771,118 @@ def related_memory_cards(db: Dict[str, Any], child_id: str, question: str) -> Li
     question_terms = memory_terms(question)
     scored = []
     for item in db["memoryItems"].values():
-        if item.get("childId") != child_id or item.get("type") != "cognitive" or item.get("status") == "deleted":
+        if item.get("childId") != child_id or item.get("status") == "deleted":
             continue
-        searchable = " ".join([str(item.get("concept", "")), str(item.get("evidence", "")), str(item.get("truthKernel", ""))])
+        memory_type = str(item.get("type", ""))
+        triggers = normalize_list(item.get("retrievalTriggers")) + normalize_list(item.get("bridgeTriggers")) + normalize_list(item.get("horizonTriggers")) + normalize_list(item.get("applicableTopics"))
+        searchable = " ".join([
+            str(item.get("concept", "")), str(item.get("evidence", "")), str(item.get("truthKernel", "")),
+            str(item.get("strategy", "")), " ".join(triggers),
+        ])
         overlap = len(question_terms.intersection(memory_terms(searchable)))
-        trust_bonus = 3 if memory_card_is_trusted(item) and item.get("parentVerified") else 2 if memory_card_is_trusted(item) else 0
-        if overlap or trust_bonus:
-            scored.append((overlap * 3 + trust_bonus + float(item.get("confidence", 0)), item))
-    return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)[:6]]
+        if memory_type == "cognitive":
+            trust_bonus = 3 if memory_card_is_trusted(item) and item.get("parentVerified") else 2 if memory_card_is_trusted(item) else 0
+            if overlap or trust_bonus:
+                scored.append((overlap * 3 + trust_bonus + float(item.get("confidence", 0)), item))
+        elif memory_type == "preference":
+            if overlap or item.get("parentVerified") or float(item.get("confidence", 0) or 0) >= 0.65:
+                scored.append((overlap * 2 + 1.5 + float(item.get("confidence", 0)), item))
+        elif memory_type in {"episode", "association", "inference"}:
+            if overlap:
+                scored.append((overlap * 3 + float(item.get("confidence", 0)), item))
+        elif memory_type == "education_skill" and item.get("status") in {"active", "known", "validated"}:
+            if overlap:
+                scored.append((overlap * 2.5 + float(item.get("reuseCount", 0) or 0) / 100 + 1, item))
+    ranked = sorted(scored, key=lambda pair: pair[0], reverse=True)
+    selected: List[Dict[str, Any]] = []
+    type_counts: Dict[str, int] = {}
+    for _, item in ranked:
+        memory_type = str(item.get("type", ""))
+        limit = 4 if memory_type == "cognitive" else 2
+        if type_counts.get(memory_type, 0) >= limit:
+            continue
+        selected.append(item)
+        type_counts[memory_type] = type_counts.get(memory_type, 0) + 1
+        if len(selected) >= 8:
+            break
+    return selected
+
+
+def chat_memory_page(
+    db: Dict[str, Any],
+    child_id: str,
+    page: int = 1,
+    page_size: int = 30,
+    query: str = "",
+    source_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    messages = sorted(
+        [item for item in db.get("messages", {}).values() if item.get("childId") == child_id],
+        key=lambda item: item.get("createdAt", ""),
+    )
+    conversations = {
+        str(item.get("id", "")): item
+        for item in db.get("conversations", {}).values()
+        if item.get("childId") == child_id
+    }
+    source_ids = [
+        str(value).strip()[:80] for value in (source_ids or [])
+        if re.fullmatch(r"[A-Za-z0-9_-]+", str(value).strip()[:80])
+    ][:12]
+    source_set = set(source_ids)
+    query = normalize_optional_text(query, 80).lower()
+    evidence_mode = bool(source_set)
+
+    if evidence_mode:
+        selected_indexes: set[int] = set()
+        for index, message in enumerate(messages):
+            if str(message.get("id", "")) not in source_set:
+                continue
+            conversation_id = message.get("conversationId")
+            same_conversation = [
+                position for position, candidate in enumerate(messages)
+                if candidate.get("conversationId") == conversation_id
+            ]
+            if index in same_conversation:
+                local_index = same_conversation.index(index)
+                selected_indexes.update(same_conversation[max(0, local_index - 2):local_index + 3])
+        filtered = [message for index, message in enumerate(messages) if index in selected_indexes]
+    else:
+        filtered = [message for message in messages if not query or query in str(message.get("text", "")).lower()]
+
+    page_size = max(10, min(50, int(page_size or 30)))
+    total = len(filtered)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(total_pages, int(page or 1)))
+    if evidence_mode:
+        page_items = filtered[:50]
+        page = 1
+        total_pages = 1
+    else:
+        newest_first = list(reversed(filtered))
+        start = (page - 1) * page_size
+        page_items = list(reversed(newest_first[start:start + page_size]))
+
+    items = []
+    for message in page_items:
+        conversation = conversations.get(str(message.get("conversationId", "")), {})
+        items.append({
+            **message,
+            "conversationTitle": normalize_optional_text(conversation.get("title"), 80) or "连续对话",
+            "isSourceEvidence": str(message.get("id", "")) in source_set,
+        })
+    matched = [source_id for source_id in source_ids if any(str(item.get("id", "")) == source_id for item in messages)]
+    return {
+        "items": items,
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": total_pages,
+        "query": query,
+        "evidenceMode": evidence_mode,
+        "sourceIds": source_ids,
+        "matchedSourceIds": matched,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3778,6 +3910,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/memory/chat":
+            params = parse_qs(parsed.query)
+            child_id = params.get("childId", [DEFAULT_CHILD_ID])[0]
+            try:
+                page = int(params.get("page", ["1"])[0])
+                page_size = int(params.get("pageSize", ["30"])[0])
+            except ValueError:
+                self.send_json({"error": "invalid_pagination", "message": "分页参数无效"}, 400); return
+            source_ids = [item for value in params.get("source", []) for item in value.split(",") if item]
+            self.send_json(chat_memory_page(load_db(), child_id, page, page_size, params.get("q", [""])[0], source_ids)); return
         if parsed.path == "/api/parent/cards":
             child_id = parse_qs(parsed.query).get("childId", [DEFAULT_CHILD_ID])[0]
             db = load_db(); prof = profile_for(db, child_id)
@@ -3787,10 +3929,15 @@ class Handler(BaseHTTPRequestHandler):
             cards = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "cognitive" and m.get("status") != "deleted"]
             cards.sort(key=lambda x: (x.get("status") == "needs_review", x.get("confidence", 0), x.get("updatedAt", "")), reverse=True)
             preferences = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "preference" and m.get("status") != "deleted"][-6:]
+            education_skills = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "education_skill" and m.get("status") != "deleted"][-8:]
+            associative_memories = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") in {"episode", "association", "inference"} and m.get("status") != "deleted"][-8:]
             safety_events = [m for m in db["safetyEvents"].values() if m.get("childId") == child_id][-6:]
             chat_count = len([m for m in messages if m.get("role") == "user"])
             viz = memory_visualization(db, child_id)
-            self.send_json({"profile": prof, "todayQuestions": today_questions, "topicCards": summarize_topics(today_questions), "knowledgeCards": cards, "confusions": [c for c in cards if c.get("confidence", 0) < 0.5 or c.get("status") == "needs_review"], "preferenceMemories": preferences, "safetyEvents": safety_events, "memoryStats": {"chat": chat_count, "cognitive": len(cards), "preference": len(preferences), "safety": len(safety_events)}, "suggestion": "今晚可以和孩子一起做一个安全小观察：走几步看远处的大树，再比较近处玩具的位置变化；睡前让孩子用自己的话讲一句今天的新发现，不纠错太多。", "companionContract": child_companion_contract(prof), **viz})
+            showcase = db.get("showcases", {}).get(child_id, {})
+            if not showcase and child_id == DEFAULT_CHILD_ID:
+                showcase = db.get("showcase", {})
+            self.send_json({"profile": prof, "isShowcase": bool(showcase), "todayQuestions": today_questions, "topicCards": summarize_topics(today_questions), "knowledgeCards": cards, "confusions": [c for c in cards if c.get("confidence", 0) < 0.5 or c.get("status") == "needs_review"], "preferenceMemories": preferences, "educationSkills": education_skills, "associativeMemories": associative_memories, "showcase": showcase, "parentFeedCards": build_parent_feed_cards(db, child_id), "feedGeneratedAt": now_iso(), "safetyEvents": safety_events, "memoryStats": {"chat": chat_count, "cognitive": len(cards), "preference": len(preferences), "safety": len(safety_events)}, "suggestion": "今晚可以和孩子一起做一个安全小观察：走几步看远处的大树，再比较近处玩具的位置变化；睡前让孩子用自己的话讲一句今天的新发现，不纠错太多。", "companionContract": child_companion_contract(prof), **viz})
             return
         if parsed.path == "/api/profile":
             child_id = parse_qs(parsed.query).get("childId", [DEFAULT_CHILD_ID])[0]
@@ -3816,6 +3963,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self.path == "/api/demo/showcase/import":
+                db = load_db()
+                result = import_showcase_child(db)
+                save_db(db)
+                self.send_json({"ok": True, **result}); return
             if self.path == "/api/profile":
                 data = self.read_json(); db = load_db(); child_id = data.get("id") or DEFAULT_CHILD_ID
                 db["profiles"][child_id] = {"id": child_id, "nickname": str(data.get("nickname", "豆豆"))[:20], "age": max(4, min(7, int(data.get("age", 5)))), "interests": normalize_list(data.get("interests")), "familiarItems": normalize_list(data.get("familiarItems")), "explanationPreference": str(data.get("explanationPreference", "先简单回答，再举例"))[:120], "voicePreference": {"enabled": parse_bool(data.get("voiceEnabled", True), True), "autoSpeak": parse_bool(data.get("autoSpeak", True), True), "rate": clamp_float(data.get("speechRate", 0.92), 0.92, 0.6, 1.2)}, "parentPinHash": pin_hash(str(data.get("parentPin", "1234"))[:16]), "createdAt": db.get("profiles", {}).get(child_id, {}).get("createdAt", now_iso()), "updatedAt": now_iso()}
@@ -3889,6 +4041,7 @@ class Handler(BaseHTTPRequestHandler):
                 db["profiles"].pop(child_id, None)
                 for key in ["conversations", "messages", "memoryItems", "parentFeedback", "safetyEvents"]:
                     db[key] = {k: v for k, v in db[key].items() if v.get("childId") != child_id}
+                db.get("showcases", {}).pop(child_id, None)
                 save_db(db); self.send_json({"ok": True, "deletedChildId": child_id}); return
             self.send_error(404)
         except Exception as e:
@@ -4098,6 +4251,193 @@ def iso_day(value: str) -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
 
+def _parent_quote(message: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    if not message:
+        return None
+    text = normalize_optional_text(message.get("text"), 160)
+    if not text:
+        return None
+    return {
+        "text": text,
+        "date": iso_day(str(message.get("createdAt", ""))),
+        "sourceId": str(message.get("id", ""))[:80],
+    }
+
+
+def question_topic(text: str) -> str:
+    if "月亮" in text or "星" in text:
+        return "太空/月亮"
+    if "影" in text or "光" in text:
+        return "光与影"
+    if "恐龙" in text:
+        return "恐龙"
+    return "其他好奇问题"
+
+
+def build_parent_feed_cards(db: Dict[str, Any], child_id: str) -> List[Dict[str, Any]]:
+    """Build a fresh, evidence-linked parent feed from the current memory store."""
+    messages = sorted(
+        [m for m in db.get("messages", {}).values() if m.get("childId") == child_id],
+        key=lambda item: item.get("createdAt", ""),
+    )
+    user_messages = [m for m in messages if m.get("role") == "user" and normalize_optional_text(m.get("text"), 160)]
+    memory_items = [
+        item for item in db.get("memoryItems", {}).values()
+        if item.get("childId") == child_id and item.get("status") != "deleted"
+    ]
+    cognitive = sorted(
+        [item for item in memory_items if item.get("type") == "cognitive"],
+        key=lambda item: item.get("updatedAt", ""),
+        reverse=True,
+    )
+    preferences = sorted(
+        [item for item in memory_items if item.get("type") == "preference"],
+        key=lambda item: item.get("updatedAt", ""),
+        reverse=True,
+    )
+    associations = sorted(
+        [item for item in memory_items if item.get("type") in {"episode", "association", "inference"}],
+        key=lambda item: item.get("updatedAt", ""),
+        reverse=True,
+    )
+    message_index = {str(message.get("id", "")): message for message in user_messages}
+
+    def quotes_for(item: Optional[Dict[str, Any]], fallback: int = 1) -> List[Dict[str, str]]:
+        source_ids = item.get("sourceMessageIds", []) if item else []
+        selected = [_parent_quote(message_index.get(str(source_id))) for source_id in source_ids]
+        quotes = [quote for quote in selected if quote]
+        if not quotes:
+            quotes = [quote for quote in (_parent_quote(message) for message in user_messages[-fallback:]) if quote]
+        return quotes[-2:]
+
+    generated_at = now_iso()
+    latest = user_messages[-1] if user_messages else None
+    recent_questions = user_messages[-24:]
+    topic_cards = summarize_topics(recent_questions)
+    strongest_topic = max(topic_cards, key=lambda item: item.get("count", 0), default=None)
+    cards: List[Dict[str, Any]] = []
+
+    if latest:
+        topic = strongest_topic.get("topic", "最近的新问题") if strongest_topic else "最近的新问题"
+        count = int(strongest_topic.get("count", 1)) if strongest_topic else 1
+        topic_messages = [
+            message for message in recent_questions
+            if question_topic(str(message.get("text", ""))) == topic
+        ]
+        topic_quotes = [quote for quote in (_parent_quote(message) for message in topic_messages[-2:]) if quote]
+        cards.append({
+            "id": "feed_recent_curiosity",
+            "type": "curiosity",
+            "eyebrow": "最近的好奇线索",
+            "title": f"最近在持续探索：{topic}",
+            "summary": f"最近 {len(recent_questions)} 次提问中，这一主题出现了 {count} 次。先顺着孩子的问题继续聊，比急着扩展到很多知识点更合适。",
+            "suggestion": "今晚可以先问：‘你现在最想弄明白这里的哪一点？’让孩子自己选择下一步。",
+            "sourceQuotes": topic_quotes,
+            "confidence": min(0.92, 0.55 + count * 0.07),
+            "memoryBasis": ["原始对话", "近期主题统计"],
+            "evidenceLevel": "观察",
+            "disclaimer": "这是对近期提问的整理，不代表固定兴趣或能力判断。",
+            "updatedAt": str(latest.get("createdAt") or generated_at),
+        })
+
+    learning = next((item for item in cognitive if item.get("status") in {"needs_review", "learning", "candidate"}), None)
+    if learning:
+        concept = normalize_optional_text(learning.get("concept"), 60) or "这个概念"
+        evidence = normalize_optional_text(learning.get("evidence"), 180)
+        cards.append({
+            "id": f"feed_learning_{str(learning.get('id', 'memory'))[:48]}",
+            "memoryId": str(learning.get("id", ""))[:80],
+            "type": "learning",
+            "eyebrow": "理解边界",
+            "title": f"「{concept}」可以再用自己的话讲一次",
+            "summary": evidence or "现有互动证据显示，这个概念还处在形成中的阶段，需要更多表达证据才能确认。",
+            "suggestion": f"不要先纠正答案，可以问：‘你觉得{concept}是怎么回事？讲给我听听。’再根据孩子的原话补一个小信息。",
+            "sourceQuotes": quotes_for(learning, 1),
+            "confidence": max(0.2, min(0.9, float(learning.get("confidence", 0.45) or 0.45))),
+            "memoryBasis": ["理解记录", "孩子原话", "家长确认" if learning.get("parentVerified") else "待家长确认"],
+            "evidenceLevel": "观察",
+            "disclaimer": "理解状态会随复述和家长确认更新，不是测评结论。",
+            "updatedAt": str(learning.get("updatedAt") or generated_at),
+        })
+
+    preference = preferences[0] if preferences else None
+    if preference:
+        preference_text = normalize_optional_text(preference.get("evidence"), 180)
+        analogy = normalize_optional_text(preference.get("effectiveAnalogy"), 120)
+        cards.append({
+            "id": f"feed_preference_{str(preference.get('id', 'memory'))[:48]}",
+            "memoryId": str(preference.get("id", ""))[:80],
+            "type": "communication",
+            "eyebrow": "沟通方式",
+            "title": "这样讲，孩子更愿意接着说",
+            "summary": preference_text or "孩子对解释方式给过明确反馈，后续回答会把这条偏好作为适配线索。",
+            "suggestion": f"家长也可以试试：先说一句核心原因，再用{analogy or '孩子熟悉的物品'}举一个例子，最后停下来等孩子追问。",
+            "sourceQuotes": quotes_for(preference, 1),
+            "confidence": max(0.2, min(0.9, float(preference.get("confidence", 0.6) or 0.6))),
+            "memoryBasis": ["表达偏好", "反馈记录"],
+            "evidenceLevel": "观察",
+            "disclaimer": "偏好不是固定标签；如果孩子近期反馈变化，旧记录会被刷新。",
+            "updatedAt": str(preference.get("updatedAt") or generated_at),
+        })
+
+    association = next((item for item in associations if item.get("type") in {"association", "inference"}), associations[0] if associations else None)
+    if association and len(quotes_for(association, 2)) >= 2:
+        title = normalize_optional_text(association.get("concept") or association.get("title"), 80) or "两次相隔较远的表达可能有关联"
+        cards.append({
+            "id": f"feed_association_{str(association.get('id', 'memory'))[:48]}",
+            "memoryId": str(association.get("id", ""))[:80],
+            "type": "association",
+            "eyebrow": "值得留意的关联",
+            "title": title,
+            "summary": normalize_optional_text(association.get("evidence"), 220) or "系统发现两段对话之间可能有共同关切，建议家长用开放问题核对。",
+            "suggestion": normalize_optional_text(association.get("parentSuggestion"), 180) or "可以温和地问：‘你刚才想到这件事时，心里在担心什么吗？’不要替孩子下结论。",
+            "sourceQuotes": quotes_for(association, 2),
+            "confidence": max(0.2, min(0.78, float(association.get("confidence", 0.55) or 0.55))),
+            "memoryBasis": ["情景记忆", "跨期关联触发", "孩子原话"],
+            "evidenceLevel": "待核对的推测",
+            "disclaimer": "这是供家长核对的低风险假设，不是心理诊断或性格标签。",
+            "updatedAt": str(association.get("updatedAt") or generated_at),
+        })
+
+    if latest:
+        latest_text = normalize_optional_text(latest.get("text"), 160)
+        if any(marker in latest_text for marker in ("月亮", "影子", "植物", "树叶", "恐龙")):
+            activity = "一起选一个熟悉的物体做五分钟观察：先让孩子猜，再一起看，最后请孩子画下变化。"
+        else:
+            activity = "一起做一张‘今天的为什么’小卡：孩子画问题，家长只写下孩子自己的解释，明天再回来补一笔。"
+        cards.append({
+            "id": "feed_parent_activity",
+            "type": "activity",
+            "eyebrow": "今天可以一起做",
+            "title": "把一次问答带回真实生活",
+            "summary": "孩子已经用语言提出问题，下一步适合通过观察或画画留下新的证据，而不是继续增加抽象讲解。",
+            "suggestion": activity,
+            "sourceQuotes": quotes_for(None, 1),
+            "confidence": 0.72,
+            "memoryBasis": ["最近一轮对话", "理解记录"],
+            "evidenceLevel": "建议",
+            "disclaimer": "活动应由家长陪同，并避开火、电、药品、尖锐物和陌生环境。",
+            "updatedAt": str(latest.get("createdAt") or generated_at),
+        })
+
+    if not cards:
+        cards.append({
+            "id": "feed_cold_start",
+            "type": "onboarding",
+            "eyebrow": "还没有足够记录",
+            "title": "先听孩子聊三个真正想问的问题",
+            "summary": "卡片会根据聊天、孩子反馈和家长确认自动刷新。记录不足时，系统不会猜测孩子的兴趣或能力。",
+            "suggestion": "可以从‘今天有没有一件奇怪的事？’开始，让孩子决定聊什么。",
+            "sourceQuotes": [],
+            "confidence": 1.0,
+            "memoryBasis": ["冷启动状态"],
+            "evidenceLevel": "说明",
+            "disclaimer": "有了真实互动证据后，这张卡会被新的摘要替换。",
+            "updatedAt": generated_at,
+        })
+    return cards[:5]
+
+
 def memory_visualization(db: Dict[str, Any], child_id: str) -> Dict[str, Any]:
     profile = profile_for(db, child_id)
     messages = sorted([m for m in db["messages"].values() if m.get("childId") == child_id], key=lambda x: x.get("createdAt", ""))
@@ -4280,8 +4620,7 @@ def memory_visualization(db: Dict[str, Any], child_id: str) -> Dict[str, Any]:
 def summarize_topics(qs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     topics: Dict[str, int] = {}
     for q in qs:
-        txt = q.get("text", "")
-        key = "太空/月亮" if "月亮" in txt or "星" in txt else "光与影" if "影" in txt or "光" in txt else "恐龙" if "恐龙" in txt else "其他好奇问题"
+        key = question_topic(str(q.get("text", "")))
         topics[key] = topics.get(key, 0) + 1
     return [{"topic": k, "count": v, "tone": "持续追问" if v > 1 else "首次探索"} for k, v in topics.items()]
 

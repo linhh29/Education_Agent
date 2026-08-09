@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+
+config/models.json
+data/demo-db.json
+logs/runtime-events.jsonl
