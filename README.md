@@ -7,7 +7,7 @@
 ## 本地启动
 
 ```bash
-cd /Users/hehailin/Desktop/VibeCoding/child-agent
+cd "/Users/kakawang/Desktop/Test/Education_Agent"
 python3 app.py
 ```
 
@@ -17,6 +17,7 @@ python3 app.py
 - 孩子设置：`http://127.0.0.1:8787/setup`
 - 儿童端：`http://127.0.0.1:8787/child`
 - 成长记录：`http://127.0.0.1:8787/memory`
+- 录制演示：`http://127.0.0.1:8787/video-demo?scene=1`
 
 如果端口被占用：
 
@@ -41,6 +42,12 @@ PORT=8791 python3 app.py
 ### 成长记录 `/memory`
 
 把聊天、理解档案、Agent 适配、系统证据和数据管理分成五层，默认独立收起。内容包括孩子的复述、哪里已经明白、哪里还需要再讲、表达偏好、家长提醒和安全事件；这些记录不会被当成固定答案直接照搬。
+
+### 录制演示 `/video-demo`
+
+这是与正式 UI 使用同一视觉语言的确定性录制前端，包含入口、连续陪伴、个性化回答、家长卡片、记忆组织、策略进化、安全审计和三阶段路线 8 个场景。底部控制台可以逐镜头切换，也可以直接使用 `?scene=1` 到 `?scene=8`。
+
+录制页只读内置的“小满 · 使用 24 天”合成 Case，不调用模型，不读取或写入 `data/demo-db.json`，也不会执行删除。它用于保证视频中的卡片顺序、原话、回答和验证指标每次一致；正式的语音、模型调用、记忆写入和家长操作仍在 `/child`、`/parent`、`/memory` 中运行。请通过本地服务 URL 打开，不要直接双击 `static/video-demo.html`。
 
 ## 回答与记录如何工作
 
@@ -223,6 +230,9 @@ scripts/generate_showcase_db.py 样例数据库生成器
 static/index.html              单页应用入口
 static/app.js                  页面、语音、交互与 API 调用
 static/styles.css              页面样式
+static/video-demo.html         只读录制演示入口
+static/video-demo.js           八镜头固定合成 Case 交互
+static/video-demo.css          录制演示样式
 static/vendor/driverjs         本地页面导览组件
 tests/                          单元、真实模型和浏览器测试
 docs/                           设计与测试文档

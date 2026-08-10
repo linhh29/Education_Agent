@@ -66,6 +66,16 @@ def unreviewed_positive_teachback():
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_shadow_scaffolds_distinguish_length_from_following(self):
+        length = app.curated_fact_scaffold("嗯，那影子为什么下午会变得很长呢？我感觉它比上午更长一些。")
+        following = app.curated_fact_scaffold("为什么我走路的时候影子会跟着我？")
+        formation = app.curated_fact_scaffold("影子是怎么形成的？")
+
+        self.assertEqual(length["id"], "shadow_length_change")
+        self.assertIn("阳光会更斜地照向地面", length["truthKernel"])
+        self.assertEqual(following["id"], "shadow_follows_body")
+        self.assertEqual(formation, {})
+
     def setUp(self):
         self.profile = app.seed_db()["profiles"][app.DEFAULT_CHILD_ID]
 

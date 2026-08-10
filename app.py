@@ -193,10 +193,36 @@ CURATED_FACT_SCAFFOLDS = [
         "childVocabulary": ["看不见的水汽", "变成小水滴", "聚大变重", "落下来成雨"],
     },
     {
+        "id": "shadow_length_change",
+        "version": 1,
+        "reviewedAt": "2026-08-10",
+        "matches": ("影子",),
+        "intentAny": ("变长", "更长", "很长", "长短", "长度", "下午", "上午", "太阳低", "斜着"),
+        "conceptLabel": "太阳高度与影子长度",
+        "truthKernel": "下午太阳在天空中的位置比上午低；阳光会更斜地照向地面；同样高的物体挡光后，影子会在地面延伸得更远，所以看起来更长。",
+        "epistemicStatus": "fact",
+        "causalChain": [
+            ["下午太阳位置低", "下午太阳比较低", "太阳的位置比上午低"],
+            ["光线斜着照", "阳光斜着照", "阳光更斜地照向地面"],
+            ["影子在地面延伸得更远", "影子铺得更远", "影子被拉长", "影子变长"],
+        ],
+        "childVocabulary": ["下午太阳比较低", "阳光斜着照", "影子铺得更远"],
+        "modeCausalChains": {
+            "example": [
+                ["手电筒放低", "把灯放低"],
+                ["光线斜着照", "阳光斜着照"],
+                ["积木的影子变长", "影子铺得更远"],
+            ],
+        },
+        "validatedExample": "在家长陪同下用手电筒照积木；把灯放低时，积木的影子会变长。",
+        "validatedExampleMarkers": ["手电筒", "积木", "灯放低", "影子会变长"],
+    },
+    {
         "id": "shadow_follows_body",
         "version": 1,
         "reviewedAt": "2026-07-25",
         "matches": ("影子",),
+        "intentAny": ("跟着", "跟", "走", "跑", "移动", "会动"),
         "conceptLabel": "光和影子",
         "truthKernel": "身体挡住一部分光，形成暗的影子；身体移动时，挡光的位置也移动，所以影子跟着移动。",
         "epistemicStatus": "fact",
@@ -921,7 +947,13 @@ def normalize_ai_response(ai: Dict[str, Any], plan: Optional[Dict[str, Any]] = N
 def curated_fact_scaffold(question: str) -> Dict[str, Any]:
     text = question or ""
     for scaffold in CURATED_FACT_SCAFFOLDS:
-        if all(marker in text for marker in scaffold["matches"]):
+        intent_any = scaffold.get("intentAny", ())
+        intent_none = scaffold.get("intentNone", ())
+        if (
+            all(marker in text for marker in scaffold["matches"])
+            and (not intent_any or any(marker in text for marker in intent_any))
+            and not any(marker in text for marker in intent_none)
+        ):
             return {
                 "id": scaffold["id"],
                 "version": scaffold.get("version", 1),
@@ -3942,6 +3974,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/profile":
             child_id = parse_qs(parsed.query).get("childId", [DEFAULT_CHILD_ID])[0]
             self.send_json(profile_for(load_db(), child_id)); return
+        if parsed.path == "/video-demo":
+            self.serve_file(STATIC_DIR / "video-demo.html", "text/html; charset=utf-8"); return
         if parsed.path in ("/", "/setup", "/child", "/parent", "/memory"):
             self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8"); return
         if parsed.path.startswith("/static/"):
