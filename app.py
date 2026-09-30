@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import fcntl
 import ipaddress
 import json
 import os
@@ -28,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, build_opener, HTTPHandler, HTTPSHandler
 import urllib.error
 from urllib.request import HTTPRedirectHandler
+from companion import CompanionService, ProductError
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -409,10 +411,11 @@ def seed_db() -> Dict[str, Any]:
                 "id": DEFAULT_CHILD_ID,
                 "nickname": "豆豆",
                 "age": 5,
+                "kind": "demo",
                 "interests": ["恐龙", "太空", "积木"],
                 "familiarItems": ["手电筒", "积木", "浴缸", "远处的大山"],
-                "explanationPreference": "先一句话回答，再用熟悉的比喻举例",
-                "voicePreference": {"enabled": True, "autoSpeak": True, "rate": 0.92},
+                "explanationPreference": "自然回答当前问题，按需要举例",
+                "voicePreference": {"enabled": False, "autoSpeak": False, "rate": 0.92},
                 "parentPinHash": pin_hash("1234"),
                 "createdAt": t,
                 "updatedAt": t,
@@ -1961,92 +1964,12 @@ def transient_model_error(exc: BaseException) -> bool:
 
 
 def call_model_json(component: str, system: str, user_payload: Dict[str, Any], temperature: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    # COSEC: 所有真实模型调用统一执行 HTTPS、固定域名白名单、DNS 公网校验和禁重定向 SSRF 防护。
-    runtime = model_component_config(component)
-    provider_config = runtime["provider"]
-    model_config = runtime["model"]
-    provider_override = (os.environ.get("LLM_PROVIDER") or os.environ.get("DEMO_LLM_PROVIDER") or "").strip().lower()
-    if provider_override and provider_override not in {"openai", "real", "auto", "openai_compatible"}:
-        write_runtime_event("llm.skipped", "llm", "skipped", component=component, details={"reason": "provider_override"})
-        return None
-    if model_config.get("enabled") is False:
-        write_runtime_event("llm.skipped", "llm", "skipped", component=component, details={"reason": "component_disabled"})
-        return None
-    # COSEC: 项目专用覆盖项和受控配置优先，避免宿主机通用 OPENAI_API_KEY 静默替换本项目凭据。
-    api_key = (
-        os.environ.get("LLM_API_KEY")
-        or model_config.get("api_key")
-        or provider_config.get("api_key")
-        or os.environ.get("OPENAI_COMPATIBLE_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    base_value = (
-        os.environ.get("LLM_BASE_URL")
-        or model_config.get("base_url")
-        or provider_config.get("base_url")
-        or os.environ.get("OPENAI_BASE_URL")
-        or ""
-    )
-    child_components = {"child_answer", "child_tutor"}
-    model_value = (os.environ.get("LLM_MODEL") if component in child_components else None) or model_config.get("model_id") or (os.environ.get("OPENAI_MODEL") if component in child_components else None)
-    if not isinstance(api_key, str) or not api_key.strip() or not isinstance(base_value, str) or not base_value.strip() or not isinstance(model_value, str) or not model_value.strip():
-        write_runtime_event("llm.skipped", "llm", "skipped", component=component, details={"reason": "configuration_incomplete"})
-        return None
-    base = base_value.strip().rstrip("/")
-    model = model_value.strip()
-    endpoint = f"{base}/chat/completions"
-    if not validate_outbound_url(endpoint):
-        raise ValueError("model base_url must be HTTPS and use a built-in public provider hostname")
-    payload = {
-        "model": model,
-        "temperature": clamp_float(temperature if temperature is not None else model_config.get("temperature", 0.2), 0.2, 0, 1),
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        "response_format": {"type": "json_object"},
-    }
-    if isinstance(model_config.get("enable_thinking"), bool):
-        payload["enable_thinking"] = model_config["enable_thinking"]
-    req = Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
-    opener = build_opener(NoRedirect, HTTPSHandler, HTTPHandler)
-    llm_timeout = model_timeout_seconds(component, model_config)
-    remaining = remaining_interaction_seconds()
-    if remaining is not None:
-        if remaining < 1.2:
-            raise TimeoutError("interaction latency budget exhausted")
-        llm_timeout = min(llm_timeout, remaining)
-    attempts = 1 if remaining is not None else (2 if component == "parent_analysis" else 1)
-    for attempt in range(attempts):
-        attempt_started = time.perf_counter()
-        write_runtime_event(
-            "llm.start", "llm", "started", component=component,
-            details={"attempt": attempt + 1, "modelId": model, "timeoutMs": round(llm_timeout * 1000), "timeoutBudgetRemainingMs": round((remaining or 0) * 1000)},
-        )
-        try:
-            with opener.open(req, timeout=llm_timeout) as resp:
-                response_bytes = resp.read()
-                data = json.loads(response_bytes.decode("utf-8"))
-            write_runtime_event(
-                "llm.finish", "llm", "completed", component=component,
-                duration_ms=round((time.perf_counter() - attempt_started) * 1000),
-                details={"attempt": attempt + 1, "modelId": model, "responseBytes": len(response_bytes), "httpStatus": getattr(resp, "status", 200)},
-            )
-            break
-        except Exception as exc:
-            error_meta = runtime_error_metadata(exc)
-            write_runtime_event(
-                "llm.error", "llm", "failed", component=component,
-                duration_ms=round((time.perf_counter() - attempt_started) * 1000),
-                error_type=error_meta.get("errorType", ""), error_code=str(error_meta.get("httpStatus", "")),
-                details={"attempt": attempt + 1, "modelId": model, **error_meta},
-            )
-            if attempt + 1 >= attempts or not transient_model_error(exc):
-                raise
-            time.sleep(0.15)
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-    parsed = json.loads(content)
-    return parsed if isinstance(parsed, dict) else None
+    """Historical alignment helpers are available to offline regressions only.
+
+    Live text calls use CompanionService's single budgeted ModelClient. Prevent
+    old scripts from making unbounded calls or selecting a different model.
+    """
+    raise RuntimeError("旧规划链的真实调用已停用；请通过正常页面使用当前模型链路。")
 
 
 def speech_runtime(component: str) -> Tuple[Dict[str, Any], str, str]:
@@ -3940,341 +3863,71 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    def product_api(self, parsed, method="GET") -> None:
+        try:
+            # A localhost demo has no account auth; reject cross-origin writes
+            # and untrusted Host headers instead of exposing a local-key proxy.
+            host = self.headers.get("Host", "").split(":")[0]
+            if host not in {"127.0.0.1", "localhost"}:
+                raise ProductError("请通过本机地址打开产品。", 403, "local_only")
+            origin = self.headers.get("Origin")
+            if origin and origin != "http://" + self.headers.get("Host", ""):
+                raise ProductError("只允许从本机产品页面操作。", 403, "origin_mismatch")
+            if method == "GET":
+                result = PRODUCT.get(parsed.path, parse_qs(parsed.query))
+            else:
+                data = self.read_json()
+                if not isinstance(data, dict):
+                    raise ProductError("请求内容格式不正确。")
+                result = PRODUCT.mutate(parsed.path, data, method)
+            self.send_json(result)
+        except ProductError as exc:
+            self.send_json({"error": exc.code, "message": str(exc)}, exc.status)
+        except (ValueError, TypeError):
+            self.send_json({"error": "invalid_request", "message": "请求内容格式不正确，请重新填写。"}, 400)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            print("[product] local operation failed:", type(exc).__name__)
+            self.send_json({"error": "local_error", "message": "本机暂时没有完成操作，请重试。"}, 500)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/memory/chat":
-            params = parse_qs(parsed.query)
-            child_id = params.get("childId", [DEFAULT_CHILD_ID])[0]
-            try:
-                page = int(params.get("page", ["1"])[0])
-                page_size = int(params.get("pageSize", ["30"])[0])
-            except ValueError:
-                self.send_json({"error": "invalid_pagination", "message": "分页参数无效"}, 400); return
-            source_ids = [item for value in params.get("source", []) for item in value.split(",") if item]
-            self.send_json(chat_memory_page(load_db(), child_id, page, page_size, params.get("q", [""])[0], source_ids)); return
-        if parsed.path == "/api/parent/cards":
-            child_id = parse_qs(parsed.query).get("childId", [DEFAULT_CHILD_ID])[0]
-            db = load_db(); prof = profile_for(db, child_id)
-            today = datetime.now(timezone.utc).date().isoformat()
-            messages = [m for m in db["messages"].values() if m.get("childId") == child_id]
-            today_questions = [m for m in messages if m.get("role") == "user"][-8:]
-            cards = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "cognitive" and m.get("status") != "deleted"]
-            cards.sort(key=lambda x: (x.get("status") == "needs_review", x.get("confidence", 0), x.get("updatedAt", "")), reverse=True)
-            preferences = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "preference" and m.get("status") != "deleted"][-6:]
-            education_skills = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") == "education_skill" and m.get("status") != "deleted"][-8:]
-            associative_memories = [m for m in db["memoryItems"].values() if m.get("childId") == child_id and m.get("type") in {"episode", "association", "inference"} and m.get("status") != "deleted"][-8:]
-            safety_events = [m for m in db["safetyEvents"].values() if m.get("childId") == child_id][-6:]
-            chat_count = len([m for m in messages if m.get("role") == "user"])
-            viz = memory_visualization(db, child_id)
-            showcase = db.get("showcases", {}).get(child_id, {})
-            if not showcase and child_id == DEFAULT_CHILD_ID:
-                showcase = db.get("showcase", {})
-            self.send_json({"profile": prof, "isShowcase": bool(showcase), "todayQuestions": today_questions, "topicCards": summarize_topics(today_questions), "knowledgeCards": cards, "confusions": [c for c in cards if c.get("confidence", 0) < 0.5 or c.get("status") == "needs_review"], "preferenceMemories": preferences, "educationSkills": education_skills, "associativeMemories": associative_memories, "showcase": showcase, "parentFeedCards": build_parent_feed_cards(db, child_id), "feedGeneratedAt": now_iso(), "safetyEvents": safety_events, "memoryStats": {"chat": chat_count, "cognitive": len(cards), "preference": len(preferences), "safety": len(safety_events)}, "suggestion": "今晚可以和孩子一起做一个安全小观察：走几步看远处的大树，再比较近处玩具的位置变化；睡前让孩子用自己的话讲一句今天的新发现，不纠错太多。", "companionContract": child_companion_contract(prof), **viz})
-            return
-        if parsed.path == "/api/profile":
-            child_id = parse_qs(parsed.query).get("childId", [DEFAULT_CHILD_ID])[0]
-            self.send_json(profile_for(load_db(), child_id)); return
+        if parsed.path.startswith("/api/"):
+            return self.product_api(parsed)
         if parsed.path == "/video-demo":
-            self.serve_file(STATIC_DIR / "video-demo.html", "text/html; charset=utf-8"); return
+            return self.serve_file(STATIC_DIR / "video-demo.html", "text/html; charset=utf-8")
         if parsed.path in ("/", "/setup", "/child", "/parent", "/memory"):
-            self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8"); return
+            return self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if parsed.path.startswith("/static/"):
-            name = parsed.path[len("/static/"):]
-            # COSEC: 路径穿越防护——静态文件只允许从固定目录按文件名读取。
-            target = (STATIC_DIR / name).resolve()
-            if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
-                self.send_error(404); return
+            target = (STATIC_DIR / parsed.path[len("/static/"):]).resolve()
+            try:
+                target.relative_to(STATIC_DIR.resolve())
+            except ValueError:
+                return self.send_error(404)
+            if not target.is_file():
+                return self.send_error(404)
             ctype = "text/css" if target.suffix == ".css" else "application/javascript" if target.suffix == ".js" else "application/octet-stream"
-            self.serve_file(target, ctype); return
+            return self.serve_file(target, ctype)
         self.send_error(404)
 
     def serve_file(self, path: Path, ctype: str) -> None:
         raw = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(raw)))
-        self.end_headers(); self.wfile.write(raw)
+        self.end_headers()
+        self.wfile.write(raw)
 
     def do_POST(self) -> None:
-        try:
-            if self.path == "/api/demo/showcase/import":
-                db = load_db()
-                result = import_showcase_child(db)
-                save_db(db)
-                self.send_json({"ok": True, **result}); return
-            if self.path == "/api/profile":
-                data = self.read_json(); db = load_db(); child_id = data.get("id") or DEFAULT_CHILD_ID
-                db["profiles"][child_id] = {"id": child_id, "nickname": str(data.get("nickname", "豆豆"))[:20], "age": max(4, min(7, int(data.get("age", 5)))), "interests": normalize_list(data.get("interests")), "familiarItems": normalize_list(data.get("familiarItems")), "explanationPreference": str(data.get("explanationPreference", "先简单回答，再举例"))[:120], "voicePreference": {"enabled": parse_bool(data.get("voiceEnabled", True), True), "autoSpeak": parse_bool(data.get("autoSpeak", True), True), "rate": clamp_float(data.get("speechRate", 0.92), 0.92, 0.6, 1.2)}, "parentPinHash": pin_hash(str(data.get("parentPin", "1234"))[:16]), "createdAt": db.get("profiles", {}).get(child_id, {}).get("createdAt", now_iso()), "updatedAt": now_iso()}
-                save_db(db); self.send_json(db["profiles"][child_id]); return
-            if self.path == "/api/chat":
-                self.handle_chat(); return
-            if self.path == "/api/runtime/events":
-                data = self.read_json()
-                event_type = str(data.get("eventType") or "")
-                status = str(data.get("status") or "completed")
-                if event_type not in RUNTIME_EVENT_TYPES or status not in RUNTIME_STATUSES:
-                    self.send_json({"error": "invalid_runtime_event"}, 400); return
-                write_runtime_event(
-                    event_type, "frontend", status,
-                    trace_id=normalize_runtime_id(data.get("traceId")), child_id=str(data.get("childId") or ""),
-                    conversation_id=str(data.get("conversationId") or ""), activity_mode=str(data.get("activityMode") or ""),
-                    feedback_mode=str(data.get("feedbackMode") or ""), component=str(data.get("component") or "ui"),
-                    duration_ms=int(data.get("durationMs") or 0), error_type=str(data.get("errorType") or ""),
-                    error_code=str(data.get("errorCode") or ""), details=data.get("details") if isinstance(data.get("details"), dict) else {},
-                )
-                self.send_json({"ok": True}); return
-            if self.path == "/api/speech/transcribe":
-                started = time.perf_counter()
-                token = None
-                try:
-                    data = self.read_json(MAX_SPEECH_BODY)
-                    trace_id = normalize_runtime_id(data.get("traceId"))
-                    token = RUNTIME_TRACE_ID.set(trace_id)
-                    audio_payload = str(data.get("audioData") or "")
-                    write_runtime_event("asr.start", "asr", "started", trace_id=trace_id, component="speech_recognition", details={"mimeType": str(data.get("mimeType") or "")[:48], "audioPayloadChars": len(audio_payload)})
-                    transcript = transcribe_speech(data.get("audioData"), data.get("mimeType"))
-                    write_runtime_event("asr.finish", "asr", "completed", trace_id=trace_id, component="speech_recognition", duration_ms=round((time.perf_counter() - started) * 1000), details={"transcriptChars": len(transcript)})
-                    self.send_json({"transcript": transcript}); return
-                except ValueError as exc:
-                    write_runtime_event("asr.error", "asr", "failed", component="speech_recognition", duration_ms=round((time.perf_counter() - started) * 1000), error_type=type(exc).__name__)
-                    self.send_json({"error": "speech_input_invalid", "message": str(exc)}, 400); return
-                except Exception as exc:
-                    write_runtime_event("asr.error", "asr", "failed", component="speech_recognition", duration_ms=round((time.perf_counter() - started) * 1000), error_type=type(exc).__name__)
-                    print(f"[speech] transcription unavailable: {type(exc).__name__}")
-                    self.send_json({"error": "speech_unavailable", "message": "语音识别暂时不可用，请再试一次或改用文字。"}, 502); return
-                finally:
-                    if token is not None:
-                        RUNTIME_TRACE_ID.reset(token)
-            if self.path == "/api/speech/synthesize":
-                started = time.perf_counter()
-                token = None
-                try:
-                    data = self.read_json()
-                    trace_id = normalize_runtime_id(data.get("traceId"))
-                    token = RUNTIME_TRACE_ID.set(trace_id)
-                    speech_text = str(data.get("text") or "")
-                    write_runtime_event("tts.start", "tts", "started", trace_id=trace_id, component="speech_synthesis", details={"textChars": len(speech_text)})
-                    result = synthesize_speech(speech_text)
-                    write_runtime_event("tts.finish", "tts", "completed", trace_id=trace_id, component="speech_synthesis", duration_ms=round((time.perf_counter() - started) * 1000), details={"hasAudio": bool(result.get("audioUrl"))})
-                    self.send_json(result); return
-                except ValueError as exc:
-                    write_runtime_event("tts.error", "tts", "failed", component="speech_synthesis", duration_ms=round((time.perf_counter() - started) * 1000), error_type=type(exc).__name__)
-                    self.send_json({"error": "speech_input_invalid", "message": str(exc)}, 400); return
-                except Exception as exc:
-                    write_runtime_event("tts.error", "tts", "failed", component="speech_synthesis", duration_ms=round((time.perf_counter() - started) * 1000), error_type=type(exc).__name__)
-                    print(f"[speech] synthesis unavailable: {type(exc).__name__}")
-                    self.send_json({"error": "speech_unavailable", "message": "自然语音暂时不可用，已切换为设备朗读。"}, 502); return
-                finally:
-                    if token is not None:
-                        RUNTIME_TRACE_ID.reset(token)
-            if self.path == "/api/memory/extract":
-                data = self.read_json(); concepts = extract_concepts(str(data.get("transcript", "")), str(data.get("answer", "")))
-                self.send_json({"knowledgeCardUpdates": concepts, "preferenceUpdates": []}); return
-            if self.path == "/api/data/delete":
-                data = self.read_json(); child_id = data.get("childId", DEFAULT_CHILD_ID); db = load_db()
-                db["profiles"].pop(child_id, None)
-                for key in ["conversations", "messages", "memoryItems", "parentFeedback", "safetyEvents"]:
-                    db[key] = {k: v for k, v in db[key].items() if v.get("childId") != child_id}
-                db.get("showcases", {}).pop(child_id, None)
-                save_db(db); self.send_json({"ok": True, "deletedChildId": child_id}); return
-            self.send_error(404)
-        except Exception as e:
-            self.send_json({"error": "server_error", "message": str(e)}, 500)
+        return self.product_api(urlparse(self.path), "POST")
 
     def do_PATCH(self) -> None:
-        try:
-            m = re.match(r"^/api/cards/([A-Za-z0-9_\-]+)$", urlparse(self.path).path)
-            if not m: self.send_error(404); return
-            card_id = m.group(1); data = self.read_json(); db = load_db(); card = db["memoryItems"].get(card_id)
-            if not card: self.send_json({"error": "not_found"}, 404); return
-            action = data.get("action") or data.get("status")
-            if action == "rollback":
-                hist = card.get("history") or []
-                if hist:
-                    prev = hist.pop()
-                    for k in ["status", "confidence", "evidence", "effectiveAnalogy", "parentVerified", "parentNote"]:
-                        if k in prev:
-                            card[k] = prev[k]
-                    card["history"] = hist
-                    card["updatedAt"] = now_iso()
-                    fb = {"id": new_id("pf"), "childId": card["childId"], "targetType": "memory", "targetId": card_id, "action": "rollback", "note": "恢复到上一次记录", "createdAt": now_iso()}
-                    db["parentFeedback"][fb["id"]] = fb
-                    save_db(db); self.send_json(card); return
-            snapshot = {k: card.get(k) for k in ["status", "confidence", "evidence", "effectiveAnalogy", "parentVerified", "parentNote"]}
-            card["history"] = (card.get("history") or [])[-4:] + [snapshot]
-            if action == "delete" or data.get("status") == "deleted":
-                card["status"] = "deleted"
-            elif data.get("status") in {"unknown", "candidate", "learning", "known", "needs_review"}:
-                card["status"] = data["status"]; card["parentVerified"] = True
-                card["confidence"] = 0.95 if data["status"] == "known" else 0.32 if data["status"] == "needs_review" else card.get("confidence", 0.5)
-            card["parentNote"] = str(data.get("note", card.get("parentNote", "")))[:240]
-            card["updatedAt"] = now_iso()
-            fb = {"id": new_id("pf"), "childId": card["childId"], "targetType": "memory", "targetId": card_id, "action": str(action), "note": card.get("parentNote", ""), "createdAt": now_iso()}
-            db["parentFeedback"][fb["id"]] = fb
-            save_db(db); self.send_json(card)
-        except Exception as e:
-            self.send_json({"error": "server_error", "message": str(e)}, 500)
+        return self.product_api(urlparse(self.path), "PATCH")
 
     def do_DELETE(self) -> None:
-        if self.path.startswith("/api/cards/"):
-            self.command = "PATCH"
-            return self.do_PATCH()
-        self.send_error(404)
-
-    def handle_chat(self) -> None:
-        data = self.read_json()
-        trace_id = normalize_runtime_id(data.get("traceId"))
-        token = RUNTIME_TRACE_ID.set(trace_id)
-        request_started = time.perf_counter()
-        child_id = str(data.get("childId") or DEFAULT_CHILD_ID)
-        conversation_id = str(data.get("conversationId") or "")
-        feedback = str(data.get("feedbackMode") or "normal")
-        feedback = feedback if feedback in VALID_FEEDBACK_MODES else "normal"
-        activity_mode = normalize_activity_mode(data.get("activityMode"))
-        write_runtime_event(
-            "request.start", "backend", "started", trace_id=trace_id,
-            child_id=child_id, conversation_id=conversation_id,
-            activity_mode=activity_mode, feedback_mode=feedback, component="chat",
-            details={
-                "inputMode": str(data.get("inputMode") or "")[:24],
-                "userTextChars": len(str(data.get("userText") or data.get("transcript") or "")),
-                "hasOriginalQuestion": bool(data.get("originalQuestion")),
-                "hasPreviousAnswer": bool(data.get("previousAnswer")),
-            },
-        )
-        try:
-            response, audit = self._handle_chat_with_data(data)
-            write_runtime_event(
-                "request.finish", "backend", "completed", trace_id=trace_id,
-                child_id=audit["childId"], conversation_id=audit["conversationId"],
-                message_id=audit["assistantMessageId"], activity_mode=audit["activityMode"],
-                feedback_mode=audit["feedbackMode"], component="chat",
-                duration_ms=round((time.perf_counter() - request_started) * 1000),
-                details={
-                    "answerChars": audit["answerChars"],
-                    "answerSource": audit["answerSource"],
-                    "generationSource": audit["generationSource"],
-                    "deliveryAccepted": audit["deliveryAccepted"],
-                    "memoryUpdates": audit["memoryUpdates"],
-                },
-            )
-            self.send_json(response)
-        except Exception as exc:
-            error_meta = runtime_error_metadata(exc)
-            write_runtime_event(
-                "request.error", "backend", "failed", trace_id=trace_id,
-                child_id=child_id, conversation_id=conversation_id,
-                activity_mode=activity_mode, feedback_mode=feedback, component="chat",
-                duration_ms=round((time.perf_counter() - request_started) * 1000),
-                error_type=error_meta.get("errorType", ""),
-                error_code=str(error_meta.get("httpStatus", "")),
-                details={"httpStatus": error_meta.get("httpStatus")} if error_meta.get("httpStatus") else {},
-            )
-            raise
-        finally:
-            RUNTIME_TRACE_ID.reset(token)
-
-    def _handle_chat_with_data(self, data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        request_started = time.perf_counter()
-        stage_started = time.perf_counter()
-        db = load_db()
-        child_id = data.get("childId", DEFAULT_CHILD_ID); profile = profile_for(db, child_id)
-        user_text = str(data.get("userText") or data.get("transcript") or "").strip()[:MAX_USER_TEXT_CHARS]
-        feedback = str(data.get("feedbackMode") or "normal")
-        feedback = feedback if feedback in VALID_FEEDBACK_MODES else "normal"
-        activity_mode = normalize_activity_mode(data.get("activityMode"))
-        strategy = turn_strategy(activity_mode=activity_mode, feedback=feedback)
-        original_question = str(data.get("originalQuestion") or "").strip()[:800]
-        previous_answer = normalize_optional_text(data.get("previousAnswer"), MAX_CHILD_ANSWER_CHARS)
-        reasoning_question = original_question if feedback == "teachback" and original_question else user_text
-        conv_id = data.get("conversationId") or new_id("conv")
-        if conv_id not in db["conversations"]:
-            db["conversations"][conv_id] = {"id": conv_id, "childId": child_id, "startedAt": now_iso(), "endedAt": None, "title": user_text[:24] or "新的好奇问题", "summary": ""}
-        safety = safety_check(" ".join([user_text, original_question]))
-        user_msg = {"id": new_id("msg"), "childId": child_id, "conversationId": conv_id, "role": "user", "text": user_text, "originalQuestion": original_question, "inputMode": data.get("inputMode", "voice"), "feedbackMode": feedback, "activityMode": activity_mode, "safetyLevel": safety["level"], "createdAt": now_iso()}
-        db["messages"][user_msg["id"]] = user_msg
-        related = related_memory_cards(db, child_id, reasoning_question)
-        request_latency = {"requestPreparation": round(time.perf_counter() - stage_started, 3)}
-        stage_started = time.perf_counter()
-        if safety["level"] != "safe":
-            ai = safe_ai_fallback()
-            workflow = {"answerSource": "safety_fallback", "generationSource": "local_safety_fallback", "questionPlan": {}, "alignmentContract": child_level_alignment(profile, feedback=feedback, related_cards=related), "quality": {"passed": True, "overall": 1.0, "scores": {"safety": 1.0}, "violations": [], "repairCount": 0}}
-        else:
-            ai, workflow = run_child_alignment_workflow(profile, user_text, feedback, related, activity_mode, original_question, previous_answer)
-        request_latency["answerWorkflow"] = round(time.perf_counter() - stage_started, 3)
-        asst_id = new_id("msg")
-        delivery_accepted = bool((workflow.get("deliveryDecision") or {}).get("deliveryValidated"))
-        stage_started = time.perf_counter()
-        if safety["level"] == "safe" and delivery_accepted:
-            updates = derive_memory_updates(reasoning_question, ai, workflow.get("questionPlan", {}))
-            changed, memory_evidence = upsert_memory(
-                db,
-                child_id,
-                updates,
-                [user_msg["id"], asst_id],
-                feedback,
-                user_text,
-                workflow.get("questionPlan"),
-                workflow.get("teachbackAssessment"),
-            )
-        elif safety["level"] == "safe":
-            changed, memory_evidence = [], [{"concept": "本轮回答", "evidenceType": "delivery_rejected", "masteryCorrect": None, "status": "not_stored", "confidence": 0}]
-        else:
-            changed, memory_evidence = [], []
-        trace = companion_trace(activity_mode, safety, related, changed, ai, workflow, memory_evidence)
-        orchestration = agent_orchestration(workflow, safety, activity_mode, feedback, changed)
-        asst_msg = {"id": asst_id, "childId": child_id, "conversationId": conv_id, "role": "assistant", "text": ai["displayText"], "safeExperiment": ai.get("safeExperiment", ""), "inputMode": "system", "feedbackMode": feedback, "activityMode": activity_mode, "safetyLevel": safety["level"], "answerSource": workflow.get("answerSource"), "generationSource": workflow.get("generationSource"), "quality": workflow.get("quality"), "deliveryDecision": workflow.get("deliveryDecision"), "alignmentContract": workflow.get("alignmentContract"), "questionPlan": workflow.get("questionPlan"), "teachbackAssessment": workflow.get("teachbackAssessment"), "memoryEvidence": memory_evidence, "trace": trace, "agentOrchestration": orchestration, "createdAt": now_iso()}
-        db["messages"][asst_msg["id"]] = asst_msg
-        if safety["level"] != "safe":
-            ev = {"id": new_id("safe"), "childId": child_id, "messageId": user_msg["id"], "category": safety["category"], "action": safety["action"], "createdAt": now_iso()}
-            db["safetyEvents"][ev["id"]] = ev
-        db["conversations"][conv_id]["summary"] = f"最近问题：{user_text[:60]}"
-        request_latency["memoryAndTrace"] = round(time.perf_counter() - stage_started, 3)
-        request_latency["persistence"] = 0
-        request_latency["serverTotal"] = round(time.perf_counter() - request_started, 3)
-        turn_trace = structured_turn_trace(request_latency, workflow, safety, strategy, related, changed)
-        asst_msg["strategy"] = strategy
-        asst_msg["turnTrace"] = turn_trace
-        stage_started = time.perf_counter()
-        save_db(db)
-        write_runtime_event(
-            "memory.write", "memory", "completed", child_id=child_id,
-            conversation_id=conv_id, message_id=asst_id, activity_mode=activity_mode,
-            feedback_mode=feedback, component="chat_history",
-            details={"userMessageId": user_msg["id"], "assistantMessageId": asst_id, "messageCount": 2},
-        )
-        if changed:
-            write_runtime_event(
-                "memory.write", "memory", "completed", child_id=child_id,
-                conversation_id=conv_id, message_id=asst_id, activity_mode=activity_mode,
-                feedback_mode=feedback, component="knowledge_memory",
-                details={"updateCount": len(changed), "deliveryAccepted": delivery_accepted},
-            )
-        else:
-            write_runtime_event(
-                "memory.skip", "memory", "skipped", child_id=child_id,
-                conversation_id=conv_id, message_id=asst_id, activity_mode=activity_mode,
-                feedback_mode=feedback, component="knowledge_memory",
-                details={"reason": "no_validated_update" if delivery_accepted else "delivery_not_validated"},
-            )
-        request_latency["persistence"] = round(time.perf_counter() - stage_started, 3)
-        request_latency["serverTotal"] = round(time.perf_counter() - request_started, 3)
-        turn_trace = structured_turn_trace(request_latency, workflow, safety, strategy, related, changed)
-        asst_msg["turnTrace"] = turn_trace
-        response = {"traceId": RUNTIME_TRACE_ID.get(), "conversationId": conv_id, "avatarState": "speaking", "activityMode": activity_mode, "answerSource": workflow.get("answerSource"), "generationSource": workflow.get("generationSource"), "deliveryDecision": workflow.get("deliveryDecision"), "questionPlan": workflow.get("questionPlan"), "teachbackAssessment": workflow.get("teachbackAssessment"), "alignmentContract": workflow.get("alignmentContract"), "quality": workflow.get("quality"), "strategy": strategy, "turnTrace": turn_trace, "agentOrchestration": orchestration, "latency": {**request_latency, "workflow": workflow.get("latencyBreakdownSeconds", {})}, "assistant": {"displayText": ai["displayText"], "speakText": ai["speakText"], "followUp": ai.get("followUp", ""), "safeExperiment": ai.get("safeExperiment", ""), "truthKernel": ai.get("truthKernel", ""), "epistemicStatus": ai.get("epistemicStatus", "fact"), "companionContract": child_companion_contract(profile)["child"], "trace": trace}, "safety": {"level": safety["level"], "needsParent": safety["needsParent"] or bool(ai.get("needsParent")), "action": ai.get("safetyAction") or safety["action"]}, "memory": {"sessionSummaryDelta": db["conversations"][conv_id]["summary"], "chatTurnId": user_msg["id"], "knowledgeCardUpdates": changed, "preferenceUpdates": [], "evidence": memory_evidence}}
-        audit = {
-            "childId": child_id,
-            "conversationId": conv_id,
-            "assistantMessageId": asst_id,
-            "activityMode": activity_mode,
-            "feedbackMode": feedback,
-            "answerChars": len(ai["displayText"]),
-            "answerSource": workflow.get("answerSource") or "",
-            "generationSource": workflow.get("generationSource") or "",
-            "deliveryAccepted": delivery_accepted,
-            "memoryUpdates": len(changed),
-        }
-        return response, audit
+        return self.product_api(urlparse(self.path), "DELETE")
 
 
 
@@ -4659,12 +4312,29 @@ def summarize_topics(qs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [{"topic": k, "count": v, "tone": "持续追问" if v > 1 else "首次探索"} for k, v in topics.items()]
 
 
+PRODUCT = None
+
+
 def main() -> None:
-    load_db()
+    global PRODUCT
     port = int(os.environ.get("PORT", "8787"))
     host = os.environ.get("HOST", "127.0.0.1")
-    print(f"好奇心 Agent demo running at http://{host}:{port}/setup")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    if host != "127.0.0.1":
+        raise ValueError("本轮本机演示只绑定 127.0.0.1")
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # One running owner per database; a second launch cannot fail live requests.
+    with DB_PATH.with_suffix(DB_PATH.suffix + ".server.lock").open("a") as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("这份演示数据已在运行，请使用已打开的页面，或为另一进程指定独立 EDUCATION_AGENT_DB。")
+        with ThreadingHTTPServer((host, port), Handler) as server:
+            PRODUCT = CompanionService(ROOT, DB_PATH, seed_db)
+            print(f"好奇心伙伴 running at http://{host}:{port}/setup", flush=True)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("本机服务已停止，记录仍保留。", flush=True)
 
 
 if __name__ == "__main__":

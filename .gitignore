@@ -9,3 +9,8 @@ __pycache__/
 config/models.json
 data/demo-db.json
 logs/runtime-events.jsonl
+logs/llm-usage.json*
+data/*.lock
+data/*.tmp
+data/local-*.json
+docs/screenshots/

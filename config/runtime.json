@@ -1,0 +1,18 @@
+{
+  "model": "qwen3.8-max-0902",
+  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "key_file": "/Users/qcw/.config/education-agent/dashscope_api_key",
+  "enable_thinking": false,
+  "thinking_budget": 1024,
+  "max_completion_tokens": 1800,
+  "timeout_seconds": 28,
+  "temperature": 0.5,
+  "max_input_bytes": 42000,
+  "budget": {
+    "prior_cny": 2.735356,
+    "additional_limit_cny": 47,
+    "total_limit_cny": 50,
+    "input_cny_per_million": 12,
+    "output_cny_per_million": 36
+  }
+}
