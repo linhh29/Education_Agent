@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import app
 from companion import CompanionService, ProductError
-from memory_support import validate_summary, summary_input
+from memory_support import validate_summary, summary_input, exploration_view
 
 
 class MemoryLifecycleTests(unittest.TestCase):
@@ -217,6 +217,8 @@ class MemoryLifecycleTests(unittest.TestCase):
         context=self.contexts[-1][1]
         self.assertEqual([e['conversationId'] for e in context['explorations']],[cid])
         self.assertEqual(context['sourceQuotes'],[])
+        self.assertIn('childFollowups',context['explorations'][0])
+        self.assertNotIn('openQuestions',context['explorations'][0])
         self.assertEqual(result['providedExplorationVersions'],[{'conversationId':cid,'version':exp['version'],'fingerprint':exp['fingerprint']}])
 
     def test_new_understanding_keeps_old_confusion_and_duplicate_does_not_grow_cards(self):
@@ -234,6 +236,97 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.assertEqual(len(third['memories']),2)
         self.update(old,'withdraw')
         self.assertEqual(self.service.store.read()['memoryItems'][old['id']]['status'],'withdrawn')
+
+    def test_explicit_feedback_reuses_valid_selection_but_not_arbitrary_text(self):
+        item=self.reminder(); self.select=[item['id']]
+        last=self.service.chat(self.req())['snapshot']['messages'][-1]
+        for action in ('example','simpler'):
+            self.contexts=[]
+            result=self.service.chat(self.req('a different question cannot hide in a feedback action',feedback=action,feedbackFor=last['id']))['snapshot']
+            last=result['messages'][-1]
+            self.assertEqual([p for p,c in self.contexts],['chat'])
+            self.assertEqual(last['retrieval']['status'],'reused')
+            self.assertEqual(last['providedMemoryVersions'],[{'id':item['id'],'version':1}])
+            self.assertNotIn('different question',self.contexts[-1][1]['currentText'])
+        self.contexts=[]
+        self.service.chat(self.req('a typed new topic',style='simpler',feedbackFor=last['id']))
+        self.assertEqual([p for p,c in self.contexts],['recall','chat'])
+
+    def test_parent_changes_require_fresh_selection_even_if_old_selection_was_empty(self):
+        self.reminder()
+        last=self.service.chat(self.req())['snapshot']['messages'][-1]
+        added=self.reminder('another topic','new parent input'); self.select=[added['id']]
+        self.contexts=[]
+        last=self.service.chat(self.req(feedback='example',feedbackFor=last['id']))['snapshot']['messages'][-1]
+        self.assertEqual([p for p,c in self.contexts],['recall','chat'])
+        self.update(added,summary='latest parent revision')
+        self.contexts=[]
+        last=self.service.chat(self.req(feedback='simpler',feedbackFor=last['id']))['snapshot']['messages'][-1]
+        self.assertEqual([p for p,c in self.contexts],['recall','chat'])
+        self.assertEqual(last['providedMemoryVersions'],[{'id':added['id'],'version':2}])
+        self.assertEqual(self.contexts[-1][1]['candidateMemories'][0]['summary'],'latest parent revision')
+
+    def test_feedback_anchor_cannot_cross_profiles_or_skip_a_newer_answer(self):
+        first=self.service.chat(self.req())['snapshot']['messages'][-1]
+        self.service.chat(self.req('a new topic'))
+        for child in (self.child,self.other):
+            with self.assertRaises(ProductError) as error:
+                self.service.chat(self.req(childId=child,feedback='example',feedbackFor=first['id']))
+            self.assertEqual(error.exception.code,'feedback_stale')
+
+    def test_failed_recall_is_attempted_again_on_explicit_feedback(self):
+        self.reminder()
+        original=self.complete
+        def unavailable(context,rid,purpose='chat'):
+            if purpose=='recall':raise ProductError('offline','504','model_timeout')
+            return original(context,rid,purpose)
+        self.service.model.complete=Mock(side_effect=unavailable)
+        last=self.service.chat(self.req())['snapshot']['messages'][-1]
+        self.service.model.complete=Mock(side_effect=original)
+        self.contexts=[]
+        self.service.chat(self.req(feedback='clarify',feedbackFor=last['id']))
+        self.assertEqual([p for p,c in self.contexts],['recall','chat'])
+
+    def test_summary_preserves_four_grounded_attempts_and_no_inferred_test_question(self):
+        messages=[{'id':'u','role':'user','text':'这个还可以怎样观察？'},{'id':'a','role':'assistant','text':'an explanation'}]
+        raw={'topic':'topic','focus':{'text':'focus','sourceMessageIds':['u']},'difficulties':[],
+             'attempts':[{'text':'attempt %s'%n,'sourceMessageIds':['a']} for n in range(4)],
+             'openQuestions':[{'text':'没有反馈，是否理解需要确认','sourceMessageIds':['u']},
+                              {'text':messages[0]['text'],'sourceMessageIds':['u']}]}
+        cleaned=validate_summary(raw,messages)
+        self.assertEqual(len(cleaned['attempts']),4)
+        self.assertEqual(cleaned['openQuestions'],[raw['openQuestions'][1]])
+        legacy=exploration_view({'messages':{m['id']:m for m in messages}},raw)
+        self.assertEqual(legacy['openQuestions'],cleaned['openQuestions'])
+        self.assertEqual(len(raw['openQuestions']),2)  # Stored history was not rewritten.
+
+    def test_feedback_retry_preserves_action_and_only_one_user_message(self):
+        item=self.reminder(); self.select=[item['id']]
+        last=self.service.chat(self.req())['snapshot']['messages'][-1]
+        req=self.req(feedback='simpler',feedbackFor=last['id'])
+        self.service.model.complete=Mock(side_effect=ProductError('offline timeout',504,'model_timeout'))
+        with self.assertRaises(ProductError):self.service.chat(req)
+        failed=self.service.snapshot(self.child)['lastRequest']
+        self.assertEqual(failed['feedback'],'simpler')
+        self.service.model.complete=Mock(side_effect=self.complete)
+        self.contexts=[]
+        result=self.service.chat(self.req(retryOf=failed['id'],feedback=failed['feedback'],feedbackFor=failed['feedbackFor']))['snapshot']
+        self.assertEqual(len(result['messages']),4)
+        self.assertEqual([p for p,c in self.contexts],['chat'])
+
+    def test_restart_rechecks_persisted_selection_without_crossing_conversations(self):
+        item=self.reminder(); self.select=[item['id']]
+        last=self.service.chat(self.req())['snapshot']['messages'][-1]
+        restarted=CompanionService(self.root,self.service.store.path,app.seed_db)
+        self.addCleanup(restarted.close)
+        restarted.model.complete=Mock(side_effect=self.complete)
+        self.contexts=[]
+        result=restarted.chat(self.req(feedback='example',feedbackFor=last['id']))['snapshot']
+        self.assertEqual([p for p,c in self.contexts],['chat'])
+        cid=result['activeConversation']['id']
+        restarted.end_conversation({'childId':self.child,'conversationId':cid})
+        with self.assertRaises(ProductError):
+            restarted.chat(self.req(feedback='example',feedbackFor=result['messages'][-1]['id']))
 
 
 if __name__=='__main__':unittest.main()

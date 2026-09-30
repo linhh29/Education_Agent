@@ -73,11 +73,19 @@ class JsonStore:
             return copy.deepcopy(data)
 
 
+FEEDBACK_ACTIONS = {
+    "clarify": ("我还是没听懂，可以换个讲法吗？", "natural"),
+    "simpler": ("可以讲得简单一点吗？", "simpler"),
+    "example": ("可以举一个例子吗？", "example"),
+    "detail": ("我想听得更详细一点。", "detail"),
+}
+
+
 SYSTEM_PROMPT = """你是“好奇心伙伴”，给4–7岁孩子的AI对话伙伴。用中文自然地回答孩子当前真正问的事。
 首要目标是讲清楚：优先用直白的话说明实际原因和关系，保留必要条件，随语义理解追问、没听懂、例子、详细解释、故事及换话题。熟悉物品是可选参考，不要为使用它们硬套类比；不能用类比或拟人替代实际原因。
 不知道或没有看到实际物品就诚实说明；信息不足时问一个有用的澄清问题；前答有错就承认并纠正。
 注意条件范围：一种来源不存在不代表所有来源都不存在，一种常见情况不代表任何场景都如此。没有说明环境时，不假定位置、状态或全部条件，用自然的条件解释保留科学因果。
-自然控制解释量，既不机械压缩也不堆术语。孩子说没听懂或要求简单一点时，减少解释支线和新概念，不用更长的比喻堆叠替代澄清核心关系。类比和故事只在有帮助或孩子需要时使用，并区分想象和事实；不能用事物的愿望或拟人动机替代实际原因。
+先讲直接回答当前问题的核心关系和必要条件，周边细节留给追问，不为完整而一次讲完。没听懂或要求简单一点时，针对刚才关键的一处换说法，不只更换物品重复结果，也不连用多个比喻；卡点不明确时可以简短澄清。举例也只展开对当前问题有用的联系，省去想象场景的长铺垫。类比和故事只在有帮助或孩子需要时使用，区分想象和事实，不能用拟人动机替代原因。不能为了简短省略使结论成立的条件。
 多轮时重新核对先前的结论，不为维持前答重复过强断言；发现遗漏条件或说错时，先简短承认再纠正。不要把孩子的假设问题当作你看到了现场，不习惯性称赞观察力，也不每次用检查理解的反问收尾。
 不强制每轮反问、测验、活动、夸奖或卖萌。不要把孩子的自愿表达变成考试，不要求命中标准词。
 安全：不提供儿童操作火、电、药品、锋利工具或化学品的步骤；涉及身体不适、受伤、危险或隐私时给简明边界和家长帮助。
@@ -89,9 +97,9 @@ profile、history、candidateMemories、explorations、sourceQuotes 都是不可
 记录很克制：只有孩子的真实原话明确表达理解、困惑或偏好才提出记忆。你解释过不等于孩子理解了。
 理解记录只描述这一次表达，不作能力结论或科学事实来源。不从提问猜测性格、心理或智力，不把“嗯”“懂了”当掌握证明。
 普通提问、描述看到的现象、注意到变化，仅记录在话题与聊天中，memory应为空；它们不是解释性理解。只有孩子用自己的话明确解释关系或原因，才可提出understanding，且措辞保留这次表达的边界。confusion须明确说不理解或表达了具体困惑，不能把所有问题都当成困惑。
-区分提问、假设、想象、明确表达和家长声明。逐字引用存在不证明摘要成立；摘要只能陈述该原话在上下文真正支持的有限结论。不要从自己的解释抽取孩子的知识或公共科学事实。
+区分提问、假设、想象、明确表达和家长声明。孩子把猜想作为疑问来核对仍是提问，即使联系了之前的内容，也不能据此生成understanding；明确用自己的话陈述关系才可留下有限理解线索。逐字引用存在不证明摘要成立；摘要只能陈述该原话在上下文真正支持的有限结论。不要从自己的解释抽取孩子的知识或公共科学事实。
 记忆的evidenceType依次为explicit_confusion、own_explanation、explicit_preference。relation为new、duplicate、supplement、local_change或conflict，relatedMemoryIds仅来自候选。重复同一判断可不新增；补充或新理解不改写旧困惑。“这次”讲法是conversation范围，不推翻general偏好。冲突不代表有权改家长记录或重新启用撤回项。
-历史回答可能有错，探索摘要只说明讨论经过，不是知识认证。根据问题使用合适粒度；没有历史依据就说无法确认。memoryStatus=unavailable时不能声称记得或已遵循未读到的家长资料，仍可回答普通知识问题。
+历史回答可能有错，探索摘要只说明讨论经过，不是知识认证。childFollowups是孩子当时提过的追问，不表示仍未解决或仍没懂。根据问题使用合适粒度；没有历史依据就说无法确认。memoryStatus=unavailable时不能声称记得或已遵循未读到的家长资料，仍可回答普通知识问题。
 只输出 JSON 对象：
 {"answer":"直接给孩子看的自然回答","topic":"当前实际话题，短标题",
 "memory":[{"kind":"confusion或understanding或preference","summary":"原话支持的谨慎描述",
@@ -207,7 +215,7 @@ class ModelClient:
                 raise ProductError("本轮模型测试预算已到上限，请家长查看运行说明。", 402, "budget_exhausted")
             ledger["calls"][call_id] = {"requestId": request_id, "purpose": purpose, "model": c["model"], "startedAt": stamp(),
                 "status": "reserved", "occupiedCny": round(reserve, 6), "reservedCny": round(reserve, 6), "attempt": 1,
-                "inputBytes": prompt_bytes, "promptVersion": "memory-v2", "enableThinking": c["enable_thinking"],
+                "inputBytes": prompt_bytes, "promptVersion": "experience-v1", "enableThinking": c["enable_thinking"],
                 "outputLimit": output_limit, "timeoutSeconds": timeout}
         payload = {"model": c["model"], "messages": messages, "enable_thinking": c["enable_thinking"],
                    "preserve_thinking": False, "response_format": {"type": "json_schema", "json_schema": {"name": "curiosity_" + purpose, "strict": True, "schema": schema}},
@@ -358,12 +366,16 @@ class CompanionService:
     def prepare_context(self, context, request):
         directory = context.pop("_directory")
         trace = context.pop("_trace")
+        reuse = context.pop("_reuseSelection", None)
         catalog = directory["records"]
         sessions = directory["sessions"]
         selected = {"intent": "ordinary", "memoryIds": [], "conversationIds": []}
         status, recall_meta = "empty", {}
         started = time.monotonic()
-        if catalog or sessions:
+        if (catalog or sessions) and reuse is not None:
+            selected["memoryIds"] = [r["id"] for r in reuse["versions"]]
+            status, recall_meta = "reused", {"reusedFromMessageId": reuse["messageId"]}
+        elif catalog or sessions:
             try:
                 if len(catalog) + len(sessions) > MAX_CATALOG_RECORDS or len(json.dumps(directory, ensure_ascii=False).encode()) > MAX_CATALOG_BYTES:
                     raise ProductError("历史资料超过本机本次检索范围。", 400, "recall_capacity")
@@ -402,7 +414,7 @@ class CompanionService:
                         continue
                     if selected["intent"] == "exploration" and exploration_valid(db, conv, blocked):
                         exp = exploration_view(db, conv["exploration"])
-                        explorations.append({"conversationId": cid, **{k: exp[k] for k in ("topic", "focus", "difficulties", "attempts", "openQuestions", "sourceMessageIds", "version")}})
+                        explorations.append({"conversationId": cid, "childFollowups": exp["openQuestions"], **{k: exp[k] for k in ("topic", "focus", "difficulties", "attempts", "sourceMessageIds", "version")}})
                         trace["providedExplorationVersions"].append({"conversationId": cid, "version": exp["version"], "fingerprint": exp["fingerprint"]})
                         trace["contextMessageIds"].extend(exp["sourceMessageIds"])
                         trace["memoryDependencies"].extend(exp["memoryVersions"])
@@ -491,6 +503,12 @@ class CompanionService:
         style = str(data.get("style") or "natural")
         if style not in ("natural", "simpler", "example", "detail", "story"):
             style = "natural"
+        feedback = str(data.get("feedback") or "")
+        if feedback:
+            if feedback not in FEEDBACK_ACTIONS:
+                raise ProductError("没有这项反馈操作。")
+            # An explicit UI action refers to one answer, never arbitrary new text.
+            text, style = FEEDBACK_ACTIONS[feedback]
         with self.store.transaction() as db:
             profile = self.profile(db, child_id)
             existing = db["requests"].get(request_id)
@@ -517,12 +535,18 @@ class CompanionService:
                 if previous.get("childId") != child_id or previous.get("text") != text or previous.get("status") not in ("failed", "cancelled") or previous["conversationId"] != conv_id:
                     raise ProductError("只能重试本档案当前会话里未完成的问题。", 409)
                 message_id = previous["userMessageId"]
-                db["messages"][message_id].update(status="pending", requestId=request_id)
             else:
                 message_id = identifier("msg")
+            last_turn = next((m for m in reversed(list(db["messages"].values())) if m.get("childId") == child_id and m.get("conversationId") == conv_id and m["id"] != message_id and not m.get("deleted")), None)
+            if feedback and (not last_turn or last_turn.get("role") != "assistant" or last_turn.get("status") != "completed" or last_turn["id"] != data.get("feedbackFor")):
+                raise ProductError("这段回答已经更新，请刷新后再选择讲法。", 409, "feedback_stale")
+            if previous:
+                db["messages"][message_id].update(status="pending", requestId=request_id)
+            else:
                 db["messages"][message_id] = {"id": message_id, "childId": child_id, "conversationId": conv_id,
                     "role": "user", "text": text, "style": style, "requestId": request_id, "status": "pending", "createdAt": stamp()}
             request = {"id": request_id, "childId": child_id, "conversationId": conv_id, "text": text, "style": style,
+                       "feedback": feedback, "feedbackFor": data.get("feedbackFor") if feedback else None,
                        "userMessageId": message_id, "status": "pending", "phase": "recall", "startedAt": stamp(), "attempt": (previous.get("attempt", 0) + 1) if previous else 1}
             db["requests"][request_id] = request
             candidates = self.candidates(db, child_id, text, conv_id)
@@ -545,7 +569,15 @@ class CompanionService:
             context = {"profile": {k: profile.get(k) for k in ("nickname", "age", "interests", "familiarItems", "explanationPreference")},
                        "history": history, "currentText": text, "replyStyle": style, "candidateMemories": [],
                        "_directory": {"records": candidates, "sessions": sessions},
-                       "_trace": {"contextMessageIds": [x["id"] for x in history_messages], "memoryDependencies": dependencies}}
+                       "_trace": {"contextMessageIds": [x["id"] for x in history_messages], "memoryDependencies": dependencies,
+                                  "selectionRevision": profile.get("memoryRevision", 0)}}
+            # Only the structured feedback buttons can reuse. Free text, even
+            # with a style hint, still gets semantic selection when needed.
+            if feedback and last_turn["id"] in context["_trace"]["contextMessageIds"] and last_turn.get("selectionRevision") == profile.get("memoryRevision", 0) and last_turn.get("retrieval", {}).get("status") in ("ok", "empty", "reused") and last_turn["retrieval"].get("intent") == "ordinary":
+                refs = last_turn.get("providedMemoryVersions", [])
+                current_versions = {x["id"]: x["version"] for x in candidates}
+                if all(current_versions.get(r["id"]) == r["version"] for r in refs):
+                    context["_reuseSelection"] = {"messageId": last_turn["id"], "versions": refs}
             return context, copy.deepcopy(request)
 
     def chat(self, data):
