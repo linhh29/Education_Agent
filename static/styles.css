@@ -149,6 +149,18 @@ summary{cursor:pointer}
 .session-row b{font-size:15px;font-weight:500;overflow-wrap:anywhere}
 .session-row small{display:block;font-size:11px;color:var(--muted);margin-top:6px}
 .memory-stack{display:grid;gap:16px}
+.record-list{padding-top:8px;padding-bottom:8px}
+.record-row{display:flex;align-items:center;gap:24px;justify-content:space-between;padding:18px 0;border-bottom:1px solid var(--line)}
+.record-row:last-child{border-bottom:0}
+.record-row>div{min-width:0;flex:1}
+.record-row h3{font-size:16px;margin:9px 0 5px}
+.record-row p{font-size:14px;margin:0 0 8px;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.record-row small{color:var(--muted);font-size:11px}
+.record-row>a{flex-shrink:0;font-size:13px}
+.source-quote{margin:14px 0 24px;padding:14px 18px;border-left:3px solid #b7d1c0;background:#f4f8f4;font-size:16px;overflow-wrap:anywhere}
+.detail-grid h2{font-size:19px;line-height:1.7;overflow-wrap:anywhere}
+.inline-details[open]>summary{margin-bottom:20px}
+.revision-history{margin-top:22px}
 .transcript{max-width:860px;margin:auto}
 .transcript .message{margin-bottom:28px}
 .transcript .message:target{outline:2px solid #a8c59b;outline-offset:9px;border-radius:10px}
@@ -259,4 +271,12 @@ footer{margin:0 18px;padding:18px 0 28px;gap:10px;flex-wrap:wrap}
 @media (max-width: 640px) {
   .exploration-columns { grid-template-columns: 1fr; gap: 12px; }
   .exploration-row { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .record-row{gap:12px;align-items:flex-start;flex-wrap:wrap}
+  .record-row>div{flex-basis:100%}
+  .record-row>a{margin-left:auto}
+  .child-heading p:not(.eyebrow){display:none}
+  .child-heading h1{font-size:23px;margin-bottom:0}
+  .chat-card{height:calc(100dvh - 300px);min-height:450px;display:flex;flex-direction:column}
+  .chat-log{height:auto;flex:1;min-height:160px}
+  .composer-area,.conversation-meta{flex-shrink:0}
 }
