@@ -4335,6 +4335,8 @@ def main() -> None:
                 server.serve_forever()
             except KeyboardInterrupt:
                 print("本机服务已停止，记录仍保留。", flush=True)
+            finally:
+                PRODUCT.close()
 
 
 if __name__ == "__main__":

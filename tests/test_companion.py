@@ -29,13 +29,19 @@ class DialogueTests(unittest.TestCase):
 
     @staticmethod
     def answer(memory=None, used=None):
-        return ({'answer':'一个自然回答，可以长也可以短。', 'topic':'自由话题', 'memory':memory or [], 'usedMemoryIds':used or []},
+        memory = [{**m, 'scope':m.get('scope','topic'), 'evidenceType':{'confusion':'explicit_confusion','understanding':'own_explanation','preference':'explicit_preference'}[m['kind']],
+                   'relation':m.get('relation','new'), 'relatedMemoryIds':m.get('relatedMemoryIds',[])} for m in memory or []]
+        return ({'answer':'一个自然回答，可以长也可以短。', 'topic':'自由话题', 'memory':memory, 'usedMemoryIds':used or []},
                 {'model':'qwen3.8-max-0902','durationMs':15,'callId':'fake_offline'})
 
     def chat(self, req, answer=None):
-        with patch.object(self.service.model, 'complete', return_value=answer or self.answer()) as model:
+        def complete(context, request_id, purpose='chat'):
+            if purpose=='recall':
+                return {'intent':'ordinary','memoryIds':[],'conversationIds':[]},{'durationMs':1}
+            return answer or self.answer()
+        with patch.object(self.service.model, 'complete', side_effect=complete) as model:
             result = self.service.chat(req)
-            self.assertEqual(model.call_count,1)
+            self.assertEqual(sum(c.kwargs.get('purpose','chat')=='chat' for c in model.call_args_list),1)
             return result
 
     def test_ordinary_answer_does_not_imply_understanding(self):
@@ -232,6 +238,23 @@ class BudgetTests(unittest.TestCase):
         record=list(self.client.ledger.read()['calls'].values())[0]
         self.assertEqual(record['status'],'failed')
         self.assertEqual(record['error'],'model_format')
+        self.assertGreater(record['occupiedCny'],0)
+
+    def test_summary_schema_constrains_ids_without_constraining_text_and_shares_budget(self):
+        summary={'topic':'一次探索','focus':{'text':'讨论了一个问题','sourceMessageIds':['msg_source']},'difficulties':[],'attempts':[],'openQuestions':[]}
+        response={'choices':[{'message':{'content':json.dumps(summary)},'finish_reason':'stop'}],'usage':{'prompt_tokens':500,'completion_tokens':100}}
+        with patch('companion.build_opener') as opener:
+            opener.return_value.open.return_value.__enter__.return_value.read.return_value=json.dumps(response).encode()
+            self.client.complete({'messages':[{'id':'msg_source','role':'user','text':'合成问题'}]},'summary_offline',purpose='exploration')
+            payload=json.loads(opener.return_value.open.call_args.args[0].data)
+        props=payload['response_format']['json_schema']['schema']['properties']
+        self.assertNotIn('enum',props['topic'])
+        self.assertNotIn('enum',props['focus']['properties']['text'])
+        self.assertEqual(props['focus']['properties']['sourceMessageIds']['items']['enum'],['msg_source'])
+        self.assertEqual(payload['model'],'qwen3.8-max-0902')
+        self.assertEqual(payload['max_completion_tokens'],1100)
+        record=list(self.client.ledger.read()['calls'].values())[0]
+        self.assertEqual(record['purpose'],'exploration')
         self.assertGreater(record['occupiedCny'],0)
 
 

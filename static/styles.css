@@ -247,3 +247,16 @@ footer{margin:0 18px;padding:18px 0 28px;gap:10px;flex-wrap:wrap}
 .suggestion-source { display: inline-block; font-size: 12px; line-height: 1.7; margin: 2px 0 6px; }
 .read-more{display:block;margin:0 24px 10px auto;border:0;border-radius:8px;padding:4px 10px;background:var(--tint);color:var(--green);font-size:12px}
 .read-more[hidden]{display:none}
+.exploration-panel { margin-top: 24px; margin-bottom: 24px; }
+.exploration-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px 0; border-top: 1px solid var(--line); }
+.exploration-row h3, .exploration-columns h3 { margin: 0 0 8px; font-size: 16px; }
+.exploration-row p { margin: 0 0 8px; }
+.exploration-row .button { flex-shrink: 0; }
+.exploration-columns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin: 20px 0; }
+.exploration-columns ul { margin: 0; padding-left: 18px; }
+.exploration-columns li { margin-bottom: 12px; }
+.exploration-columns a { font-size: 12px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .exploration-columns { grid-template-columns: 1fr; gap: 12px; }
+  .exploration-row { align-items: flex-start; flex-direction: column; gap: 12px; }
+}
