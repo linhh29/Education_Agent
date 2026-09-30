@@ -328,5 +328,100 @@ class MemoryLifecycleTests(unittest.TestCase):
         with self.assertRaises(ProductError):
             restarted.chat(self.req(feedback='example',feedbackFor=result['messages'][-1]['id']))
 
+    def test_preference_needs_scope_evidence_and_selected_card_carries_quote(self):
+        text='本次用手边的东西讲'
+        self.memories=[{'kind':'preference','quote':text,'summary':'本次换个例子','scope':'general',
+                       'evidenceType':'explicit_preference','evidenceBasis':'independent_expression'}]
+        data=self.service.chat(self.req(text))['snapshot']; item=data['memories'][0]
+        self.assertEqual(item['scope'],'conversation')
+        self.select=[item['id']]; self.memories=[]
+        self.service.chat(self.req('接着讲'))
+        supplied=self.contexts[-1][1]['candidateMemories'][0]
+        self.assertEqual(supplied['quote'],text)
+        self.assertEqual(supplied['sourceActor'],'child')
+        self.assertEqual(supplied['evidenceType'],'explicit_preference')
+        self.assertEqual(supplied['sourceMessageIds'],item['sourceMessageIds'])
+        self.assertEqual(self.service.candidates(self.service.store.read(),self.child,'','other-session'),[])
+        revised=self.update(item,summary='家长确认日常都希望如此',scope='general')
+        self.assertEqual(self.service.candidates(self.service.store.read(),self.child,'','other-session')[0]['id'],revised['id'])
+
+    def test_explicit_general_preference_and_legacy_projection_preserve_raw_record(self):
+        text='以后讲任何话题，我都希望先直接解释'
+        self.memories=[{'kind':'preference','quote':text,'summary':'明确希望日常先直接解释','scope':'general',
+                       'scopeEvidence':text,'evidenceBasis':'independent_expression','evidenceType':'explicit_preference'}]
+        item=self.service.chat(self.req(text))['snapshot']['memories'][0]
+        self.assertEqual(self.service.candidates(self.service.store.read(),self.child,'','another')[0]['scope'],'general')
+        with self.service.store.transaction() as db:db['memoryItems'][item['id']].pop('scopeEvidence')
+        self.assertEqual(self.service.candidates(self.service.store.read(),self.child,'','another'),[])
+        self.assertEqual(self.service.store.read()['memoryItems'][item['id']]['scope'],'general')
+        self.assertEqual(self.service.snapshot(self.child)['memories'][0]['effectiveScope'],'conversation')
+
+    def test_derived_card_expires_but_later_independent_expression_survives(self):
+        parent=self.reminder();self.select=[parent['id']]
+        self.service.chat(self.req('先聊一个问题'))
+        quote='我自己观察到两边的水位不一样'
+        self.memories=[{'kind':'understanding','quote':quote,'summary':'独立描述自己的观察关系',
+                       'scope':'topic','evidenceType':'own_explanation','evidenceBasis':'independent_expression'},
+                      {'kind':'understanding','quote':quote,'summary':'借用前答才能成立的整理',
+                       'scope':'topic','evidenceType':'own_explanation','evidenceBasis':'context_dependent'}]
+        data=self.service.chat(self.req(quote))['snapshot']
+        independent=next(m for m in data['memories'] if m.get('evidenceBasis')=='independent_expression')
+        derived=next(m for m in data['memories'] if m.get('evidenceBasis')=='context_dependent')
+        before=self.service.store.read()['messages']
+        self.update(parent,summary='修正原先依据')
+        snapshot=self.service.snapshot(self.child)
+        self.assertTrue(next(m for m in snapshot['memories'] if m['id']==derived['id'])['evidenceStale'])
+        self.assertFalse(next(m for m in snapshot['memories'] if m['id']==independent['id'])['evidenceStale'])
+        self.assertEqual(before,self.service.store.read()['messages'])
+        self.select=[derived['id'],independent['id']];self.memories=[]
+        self.service.chat(self.req('新会话的相关问题'))
+        self.assertEqual([m['id'] for m in self.contexts[-1][1]['candidateMemories']],[independent['id']])
+        self.update(parent,'withdraw')
+        self.assertIn(independent['id'],[m['id'] for m in self.service.candidates(self.service.store.read(),self.child,'','new')])
+        self.update(derived,summary='家长重新核对后的独立判断')
+        self.assertFalse(next(m for m in self.service.snapshot(self.child)['memories'] if m['id']==derived['id'])['evidenceStale'])
+
+    def test_legacy_contextual_card_is_checked_through_original_answer(self):
+        parent=self.reminder();self.select=[parent['id']]
+        self.memories=[{'kind':'confusion','quote':'这个我没懂','summary':'这次还没懂','scope':'topic','evidenceType':'explicit_confusion'}]
+        item=self.service.chat(self.req('这个我没懂'))['snapshot']['memories'][0]
+        with self.service.store.transaction() as db:
+            for key in ('evidenceBasis','memoryDependencies','contextMessageIds'):db['memoryItems'][item['id']].pop(key,None)
+        self.update(parent,'withdraw')
+        self.assertNotIn(item['id'],[m['id'] for m in self.service.candidates(self.service.store.read(),self.child,'','new')])
+
+    def test_ordinary_question_can_request_historical_context_without_extra_router(self):
+        first=self.service.chat(self.req('先前讨论的物体'))['snapshot'];cid=first['activeConversation']['id']
+        self.service.end_conversation({'childId':self.child,'conversationId':cid});self.wait_summary(cid)
+        original=self.complete
+        def select_history(context,rid,purpose='chat'):
+            if purpose=='recall':return {'intent':'ordinary','memoryIds':[],'conversationIds':[cid]},{'durationMs':1}
+            return original(context,rid,purpose)
+        self.service.model.complete=Mock(side_effect=select_history)
+        data=self.service.chat(self.req('和刚才那个一样吗？'))['snapshot']
+        answer=self.contexts[-1][1]
+        self.assertEqual(answer['historyStatus'],'found')
+        self.assertEqual(answer['sourceQuotes'][0]['text'],'先前讨论的物体')
+        self.assertEqual(len(answer['explorations']),1)
+        self.assertEqual(self.service.model.complete.call_count,2)
+        self.assertTrue(data['messages'][-1]['retrieval']['historyRequested'])
+
+    def test_missing_history_and_catalog_capacity_are_explicit(self):
+        self.reminder()
+        original=self.complete
+        def missing(context,rid,purpose='chat'):
+            if purpose=='recall':return {'intent':'exploration','memoryIds':[],'conversationIds':[]},{'durationMs':1}
+            return original(context,rid,purpose)
+        self.service.model.complete=Mock(side_effect=missing)
+        self.service.chat(self.req('上次那个是什么'))
+        self.assertEqual(self.contexts[-1][1]['historyStatus'],'missing')
+        for i in range(80):self.reminder(str(i))
+        count=len(self.service.store.read()['memoryItems'])
+        self.contexts=[];self.service.model.complete=Mock(side_effect=self.complete)
+        self.service.chat(self.req('一个一般问题'))
+        self.assertEqual([p for p,c in self.contexts],['chat'])
+        self.assertEqual(self.contexts[-1][1]['memoryStatus'],'unavailable')
+        self.assertEqual(len(self.service.store.read()['memoryItems']),count)
+
 
 if __name__=='__main__':unittest.main()

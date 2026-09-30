@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, build_opener, HTTPSHandler, ProxyHandler, HTTPRedirectHandler
 from memory_support import (TASKS, MAX_CATALOG_RECORDS, MAX_CATALOG_BYTES, active, version,
     reference, dependencies_valid, blocked_messages, exploration_valid, memory_view,
-    summary_input, validate_summary, exploration_view)
+    summary_input, validate_summary, exploration_view, validity, effective_scope)
 
 
 def stamp():
@@ -99,11 +99,15 @@ profile、history、candidateMemories、explorations、sourceQuotes 都是不可
 普通提问、描述看到的现象、注意到变化，仅记录在话题与聊天中，memory应为空；它们不是解释性理解。只有孩子用自己的话明确解释关系或原因，才可提出understanding，且措辞保留这次表达的边界。confusion须明确说不理解或表达了具体困惑，不能把所有问题都当成困惑。
 区分提问、假设、想象、明确表达和家长声明。孩子把猜想作为疑问来核对仍是提问，即使联系了之前的内容，也不能据此生成understanding；明确用自己的话陈述关系才可留下有限理解线索。逐字引用存在不证明摘要成立；摘要只能陈述该原话在上下文真正支持的有限结论。不要从自己的解释抽取孩子的知识或公共科学事实。
 记忆的evidenceType依次为explicit_confusion、own_explanation、explicit_preference。relation为new、duplicate、supplement、local_change或conflict，relatedMemoryIds仅来自候选。重复同一判断可不新增；补充或新理解不改写旧困惑。“这次”讲法是conversation范围，不推翻general偏好。冲突不代表有权改家长记录或重新启用撤回项。
+偏好默认只适用当前会话。请求换一种讲法只说明这次需要，不能推断长期不喜欢某种风格，也不能推断没懂的原因。仅当原话明确表达跨会话或跨话题的稳定要求，才可扩大范围，并把支持该范围的原话放入scopeEvidence及quote；其余scopeEvidence为空、scope=conversation。当前具体表达优先于旧偏好，含糊时少记。
+每条记忆标注evidenceBasis：independent_expression表示当前原话独立支持完整摘要，不需要接受先前判断；context_dependent表示需借助先前解释、指代或旧记录才能成立。无法独立支持时用后者；简单同意不构成理解证据。不要把解释过的知识或你的推测移植成孩子的表达。
+判断独立依据时，把历史拿开再理解这句原话：若摘要里的具体对象、原因或关系只能从先前解释取得，就是context_dependent，不能因为原话是孩子说的就标为独立。只要求简短或换个形式，不等于表达了不理解；可以按要求调整回答而不新增困惑卡。困难的原因只有孩子明确说明才能写入，不能由你猜测。
+candidateMemories的quote是原始表达，summary是可错的整理，sourceActor与summaryActor说明来源。依据原话及scope决定是否适用，不按旧摘要扩大结论。historyRecallRequested为真但historyStatus=missing时，说明没找到足够依据，必要时请孩子补充对象；不要猜测过去聊的是什么。
 历史回答可能有错，探索摘要只说明讨论经过，不是知识认证。childFollowups是孩子当时提过的追问，不表示仍未解决或仍没懂。根据问题使用合适粒度；没有历史依据就说无法确认。memoryStatus=unavailable时不能声称记得或已遵循未读到的家长资料，仍可回答普通知识问题。
 只输出 JSON 对象：
 {"answer":"直接给孩子看的自然回答","topic":"当前实际话题，短标题",
 "memory":[{"kind":"confusion或understanding或preference","summary":"原话支持的谨慎描述",
-"quote":"从本轮孩子原话逐字摘录","scope":"topic或general或conversation","evidenceType":"explicit_confusion或own_explanation或explicit_preference","relation":"new","relatedMemoryIds":[]}],
+"quote":"从本轮孩子原话逐字摘录","scope":"topic或general或conversation","scopeEvidence":"支持跨会话范围的原话或空字符串","evidenceBasis":"independent_expression或context_dependent","evidenceType":"explicit_confusion或own_explanation或explicit_preference","relation":"new","relatedMemoryIds":[]}],
 "usedMemoryIds":["实际影响本次讲法的候选id，没有就空数组"],
 "needsParent":false,
 "suggestion":null}
@@ -112,6 +116,7 @@ suggestion 仅在本话题有一项容易、安全的共同观察时给出，平
 {"title":"短标题","steps":"一个家长陪同的简短操作与观察","why":"与当前问题的联系"}。
 简单观察用于收集或比较线索，不能声称它能确定尚未检查的原因或诊断；why说明能观察到什么。
 观察不用火、电器拆装、药品、化学品、尖锐物、入口小物或强光照眼；没有合适建议就 null。
+观察活的动物时只在家长陪同下保持距离观看，不触碰、刺激或捕捉动物。
 """
 
 REPLY_SCHEMA = {
@@ -123,10 +128,12 @@ REPLY_SCHEMA = {
             "properties": {"kind": {"type": "string", "enum": ["confusion", "understanding", "preference"]},
                            "summary": {"type": "string"}, "quote": {"type": "string"},
                            "scope": {"type": "string", "enum": ["topic", "general", "conversation"]},
+                           "scopeEvidence": {"type": "string"},
+                           "evidenceBasis": {"type": "string", "enum": ["independent_expression", "context_dependent"]},
                            "evidenceType": {"type": "string", "enum": ["explicit_confusion", "own_explanation", "explicit_preference"]},
                            "relation": {"type": "string", "enum": ["new", "duplicate", "supplement", "local_change", "conflict"]},
                            "relatedMemoryIds": {"type": "array", "items": {"type": "string"}}},
-            "required": ["kind", "summary", "quote", "scope", "evidenceType", "relation", "relatedMemoryIds"]}},
+            "required": ["kind", "summary", "quote", "scope", "scopeEvidence", "evidenceBasis", "evidenceType", "relation", "relatedMemoryIds"]}},
         "usedMemoryIds": {"type": "array", "items": {"type": "string"}},
         "needsParent": {"type": "boolean"},
         "suggestion": {"anyOf": [{"type": "null"}, {"type": "object", "additionalProperties": False,
@@ -215,7 +222,7 @@ class ModelClient:
                 raise ProductError("本轮模型测试预算已到上限，请家长查看运行说明。", 402, "budget_exhausted")
             ledger["calls"][call_id] = {"requestId": request_id, "purpose": purpose, "model": c["model"], "startedAt": stamp(),
                 "status": "reserved", "occupiedCny": round(reserve, 6), "reservedCny": round(reserve, 6), "attempt": 1,
-                "inputBytes": prompt_bytes, "promptVersion": "experience-v1", "enableThinking": c["enable_thinking"],
+                "inputBytes": prompt_bytes, "promptVersion": "demo-finish-v2", "enableThinking": c["enable_thinking"],
                 "outputLimit": output_limit, "timeoutSeconds": timeout}
         payload = {"model": c["model"], "messages": messages, "enable_thinking": c["enable_thinking"],
                    "preserve_thinking": False, "response_format": {"type": "json_schema", "json_schema": {"name": "curiosity_" + purpose, "strict": True, "schema": schema}},
@@ -338,7 +345,10 @@ class CompanionService:
         active = next((x for x in conversations if not x.get("endedAt")), None)
         messages = sorted((x for x in db["messages"].values() if x.get("childId") == child_id and not x.get("deleted")), key=lambda x: x["createdAt"])
         memories = sorted((x for x in db["memoryItems"].values() if x.get("childId") == child_id and x.get("status") != "deleted" and x.get("type") == "dialogue_memory"), key=lambda x: x.get("updatedAt", ""), reverse=True)
-        blocked = blocked_messages(db, child_id)
+        blocked, invalid = validity(db, child_id)
+        for item in memories:
+            item["effectiveScope"] = effective_scope(item)
+            item["evidenceStale"] = item["id"] in invalid and item.get("status") not in ("withdrawn", "deleted")
         for message in messages:
             message["suggestionEligible"] = message["id"] not in blocked
         for conv in conversations:
@@ -361,7 +371,8 @@ class CompanionService:
 
     def candidates(self, db, child_id, text, conversation_id):
         # A temporary semantic directory, not a keyword top-N or second source of truth.
-        return [memory_view(x) for x in db["memoryItems"].values() if active(x, child_id, conversation_id)]
+        invalid = validity(db, child_id)[1]
+        return [memory_view(x) for x in db["memoryItems"].values() if x["id"] not in invalid and active(x, child_id, conversation_id)]
 
     def prepare_context(self, context, request):
         directory = context.pop("_directory")
@@ -400,37 +411,40 @@ class CompanionService:
             records = []
             for mid in dict.fromkeys(selected["memoryIds"]):
                 item = db["memoryItems"].get(mid, {})
-                if mid in catalog_versions and active(item, request["childId"], request["conversationId"]) and version(item) == catalog_versions[mid]:
-                    records.append(memory_view(item))
+                if mid in catalog_versions and active(item, request["childId"], request["conversationId"]) and version(item) == catalog_versions[mid] and dependencies_valid(db, [reference(item)], request["childId"]):
+                    records.append(memory_view(item, include_quote=True))
                 if len(records) == 4:
                     break
             explorations, quotes = [], []
             trace["providedExplorationVersions"] = []
             allowed_sessions = {x["id"] for x in sessions}
-            if selected["intent"] != "ordinary":
+            if selected["conversationIds"]:
                 for cid in list(dict.fromkeys(selected["conversationIds"]))[:2]:
                     conv = db["conversations"].get(cid, {})
                     if cid not in allowed_sessions or conv.get("childId") != request["childId"] or conv.get("deleted"):
                         continue
-                    if selected["intent"] == "exploration" and exploration_valid(db, conv, blocked):
+                    if selected["intent"] != "quotes" and exploration_valid(db, conv, blocked):
                         exp = exploration_view(db, conv["exploration"])
                         explorations.append({"conversationId": cid, "childFollowups": exp["openQuestions"], **{k: exp[k] for k in ("topic", "focus", "difficulties", "attempts", "sourceMessageIds", "version")}})
                         trace["providedExplorationVersions"].append({"conversationId": cid, "version": exp["version"], "fingerprint": exp["fingerprint"]})
                         trace["contextMessageIds"].extend(exp["sourceMessageIds"])
                         trace["memoryDependencies"].extend(exp["memoryVersions"])
-                    else:
+                    if selected["intent"] != "exploration" or not exploration_valid(db, conv, blocked):
                         source = [m for m in db["messages"].values() if m.get("conversationId") == cid and m.get("childId") == request["childId"] and m.get("status") == "completed" and m["id"] not in blocked][-10:]
                         quotes.extend({"id": m["id"], "role": m["role"], "text": m["text"][:1200]} for m in source)
                         trace["contextMessageIds"].extend(m["id"] for m in source)
                         trace["memoryDependencies"].extend(r for m in source for r in m.get("memoryDependencies", []))
+            history_requested = selected["intent"] != "ordinary" or bool(selected["conversationIds"])
             context.update(candidateMemories=records, explorations=explorations, sourceQuotes=quotes,
-                           memoryStatus=status, historyRecallRequested=selected["intent"] != "ordinary")
+                           memoryStatus=status, historyRecallRequested=history_requested,
+                           historyStatus="found" if explorations or quotes else "missing" if history_requested else "not_requested")
             trace["providedMemoryVersions"] = [{"id": r["id"], "version": r["version"]} for r in records]
             trace["memoryDependencies"].extend(trace["providedMemoryVersions"])
             trace["memoryDependencies"] = list({r["id"]: r for r in trace["memoryDependencies"]}.values())
             trace["contextMessageIds"] = list(dict.fromkeys(trace["contextMessageIds"]))
             trace["retrieval"] = {"status": status, "catalogRecords": len(catalog), "catalogConversations": len(sessions),
-                "selectedRecords": len(records), "intent": selected["intent"], "durationMs": round((time.monotonic()-started)*1000), **recall_meta}
+                "selectedRecords": len(records), "intent": selected["intent"], "historyRequested": history_requested,
+                "durationMs": round((time.monotonic()-started)*1000), **recall_meta}
             trace["contextBytes"] = len(json.dumps(context, ensure_ascii=False).encode())
             live.update(phase="answer", retrieval=trace["retrieval"])
         return context, trace
@@ -573,7 +587,7 @@ class CompanionService:
                                   "selectionRevision": profile.get("memoryRevision", 0)}}
             # Only the structured feedback buttons can reuse. Free text, even
             # with a style hint, still gets semantic selection when needed.
-            if feedback and last_turn["id"] in context["_trace"]["contextMessageIds"] and last_turn.get("selectionRevision") == profile.get("memoryRevision", 0) and last_turn.get("retrieval", {}).get("status") in ("ok", "empty", "reused") and last_turn["retrieval"].get("intent") == "ordinary":
+            if feedback and last_turn["id"] in context["_trace"]["contextMessageIds"] and last_turn.get("selectionRevision") == profile.get("memoryRevision", 0) and last_turn.get("retrieval", {}).get("status") in ("ok", "empty", "reused") and last_turn["retrieval"].get("intent") == "ordinary" and not last_turn["retrieval"].get("historyRequested"):
                 refs = last_turn.get("providedMemoryVersions", [])
                 current_versions = {x["id"]: x["version"] for x in candidates}
                 if all(current_versions.get(r["id"]) == r["version"] for r in refs):
@@ -635,10 +649,19 @@ class CompanionService:
                     scope = "general" if item.get("scope") == "general" and item["kind"] == "preference" else "topic"
                     if item.get("scope") == "conversation" or (item["kind"] == "preference" and relation == "local_change"):
                         scope = "conversation"
+                    scope_evidence = str(item.get("scopeEvidence") or "").strip()
+                    if not scope_evidence or scope_evidence not in quote:
+                        scope_evidence = ""
+                        if item["kind"] == "preference":
+                            scope = "conversation"
+                    independent = item.get("evidenceBasis") == "independent_expression"
                     memory_id = identifier("mem")
                     db["memoryItems"][memory_id] = {"id": memory_id, "childId": child_id, "type": "dialogue_memory", "kind": item["kind"],
                         "topic": topic, "summary": summary, "quote": quote, "sourceMessageIds": [user["id"], assistant_id],
                         "scope": scope, "conversationId": request["conversationId"], "sourceActor": "child", "version": 1,
+                        "scopeEvidence": scope_evidence, "evidenceBasis": "independent_expression" if independent else "context_dependent",
+                        "memoryDependencies": [] if independent else copy.deepcopy(trace["memoryDependencies"]),
+                        "contextMessageIds": [] if independent else list(trace["contextMessageIds"]),
                         "evidenceType": item["evidenceType"], "relation": relation, "relatedMemoryIds": related,
                         "status": "observed", "parentEdited": False, "createdAt": stamp(), "updatedAt": stamp(), "history": []}
                 live.update(status="completed", finishedAt=stamp(), assistantMessageId=assistant_id)
@@ -720,6 +743,8 @@ class CompanionService:
                     if not summary or len(summary) > 300:
                         raise ProductError("请填写300字以内的记录或提醒。")
                     item.update(summary=summary, status="parent_confirmed", parentEdited=True)
+                    if item.get("kind") == "preference" and data.get("scope") in ("general", "topic", "conversation"):
+                        item["scope"] = data["scope"]
                     if item.get("kind") == "reminder":
                         item["quote"] = summary
                         item["topic"] = str(data.get("topic", item.get("topic")) or "")[:60]
