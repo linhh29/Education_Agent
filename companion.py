@@ -299,7 +299,8 @@ def safe_suggestion(raw):
         return None
     # This narrow guard applies to suggested actions, not normal science answers.
     text = title + "\n" + steps
-    for danger in re.finditer(r"火|插座|电线|开水|刀|药|漂白|清洁剂|吞|尝|舔|直视太阳|照.*?眼|独自|马路", text):
+    optical_sun = r"(?:镜子|镜片|放大镜)[^。！？!?；;，,\n]{0,20}(?:对着|对准|朝向)太阳"
+    for danger in re.finditer(optical_sun + r"|火|插座|电线|开水|刀|药|漂白|清洁剂|吞|尝|舔|直视太阳|照.*?眼|独自|马路", text):
         prefix = re.split(r"[。！？!?；;，,、：:\n]", text[:danger.start()])[-1]
         # Exempt only this occurrence in a directly negated action, never
         # a whole sentence/activity. A later affirmative action is checked

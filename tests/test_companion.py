@@ -51,7 +51,7 @@ class DialogueTests(unittest.TestCase):
 
     def test_activity_guard_checks_each_action_not_the_whole_negative_sentence(self):
         allowed = ['由家长拿叶子，只看，不品尝。', '不要尝或舔叶子，只观察。', '家长拿手电，注意不要照眼睛。', '只看形状，不用刀，也不要点火。']
-        denied = ['先品尝叶子。', '不要品尝叶子，然后尝一下。', '不要舔叶子，但可以品尝。', '不要看而是尝一下。', '不能不品尝。', '由家长点火，孩子不要品尝。', '不要照眼睛，然后把手电照向孩子眼睛。', '不怕开水，倒一点。', '不要品尝，独自在马路边观察。']
+        denied = ['先品尝叶子。', '不要品尝叶子，然后尝一下。', '不要舔叶子，但可以品尝。', '不要看而是尝一下。', '不能不品尝。', '由家长点火，孩子不要品尝。', '不要照眼睛，然后把手电照向孩子眼睛。', '用手电照向，孩子的眼睛。', '不怕开水，倒一点。', '不要品尝，独自在马路边观察。', '拿一面小镜子对着太阳（注意不要照到眼睛），把光斑投到墙上。', '用放大镜对准太阳，不要品尝材料。']
         for steps in allowed + denied:
             with self.subTest(steps=steps):
                 self.assertEqual(safe_suggestion({'title': '一起观察', 'steps': steps, 'why': '观察'}) is not None, steps in allowed)
