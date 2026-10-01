@@ -189,11 +189,11 @@ form textarea{resize:vertical;line-height:1.7}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 /* Parent views share the existing shell and detail routes. */
-.record-list .record-row{display:flex;align-items:flex-start;gap:20px;padding:17px 0;min-height:0}
-.record-list .record-row>p{flex:1;margin:0;line-height:1.7}
-.record-list .record-row>a{flex:none;padding:3px 0;white-space:nowrap}
-.memory-group+ .memory-group{border-top:1px solid var(--line,#e1e7e5);padding-top:20px;margin-top:6px}
-.memory-group h2{font-size:16px;margin:0;color:#526861}
+main:has(>.parent-tabs){max-width:880px}
+.record-list{padding:0;border-top:1px solid var(--line)}
+.record-list .record-row{display:flex;align-items:baseline;justify-content:flex-start;gap:18px;padding:12px 0;min-height:0}
+.record-list .record-body{flex:0 1 auto;min-width:0;max-width:660px;color:var(--ink);font-size:15px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.record-list .record-edit{flex:none;display:inline-flex;align-items:center;min-height:44px;min-width:44px;white-space:nowrap}
 .parent-activity{margin-bottom:24px}
 .parent-activity h2{font-size:20px;margin-top:0}
 .parent-activity dl{margin:14px 0;display:grid;grid-template-columns:80px 1fr;gap:10px 14px;line-height:1.7}
@@ -230,5 +230,5 @@ form textarea{resize:vertical;line-height:1.7}
  .parent-tabs{gap:18px}.parent-tabs a{white-space:nowrap}
  .parent-activity dl{grid-template-columns:1fr;gap:3px}.parent-activity dd{margin-bottom:12px}
  .parent-chat{padding:18px}.parent-log{max-height:52vh}.parent-draft{padding:14px}
- .parent-compose-footer .muted{font-size:13px}.record-list .record-row{gap:14px}
+ .parent-compose-footer .muted{font-size:13px}.record-list .record-row{gap:0;align-items:flex-start}.record-list .record-edit{margin-top:2px}
 }
