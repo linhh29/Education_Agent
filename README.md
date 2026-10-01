@@ -13,6 +13,12 @@ python3 app.py
 
 打开 [好奇心伙伴](http://127.0.0.1:8787/child)。服务只绑定本机；同一数据文件只允许一个进程。Ctrl+C 停止。后端从 `/Users/qcw/.config/education-agent/dashscope_api_key` 读取 Key，页面不接收密钥。新 checkout 不含本机资料；从“＋ 新建档案”开始即可。
 
+## 本轮候选与已知问题
+
+2026-10-02 综合验收固定产品候选 `06356d4`。原演示服务和资料保留；新候选当前位于 [8788入口](http://127.0.0.1:8788/child)，使用独立普通演示副本 `data/local-investor-rc32-db.json`，启动命令为 `PORT=8788 EDUCATION_AGENT_DB=data/local-investor-rc32-db.json python3 app.py`。测试档案保存在另一个 `data/local-rc32-db.json`。
+
+家长旧草稿意外恢复撤回记录已修复；家长日期、活动否定安全提示误拦和个别科学解释仍有明确问题，综合验收未放行。32例逐项结果、真实对话、费用、截图及人工确认事项统一见 [交接摘要](docs/CODEX_HANDOFF.md)。
+
 ## 使用与演示
 
 2026-10-02 家长网页整合为“聊天记录”“家长问答”“孩子档案”。新增独立的家长文字问答、待保存草稿及活动调整入口；孩子端模型、prompt、memory 与语音逻辑保持原样。实际验证范围及局限见 [交接摘要](docs/CODEX_HANDOFF.md)。
