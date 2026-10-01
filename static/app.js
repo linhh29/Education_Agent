@@ -173,6 +173,13 @@ async function operate(button,fn){
  if(button.disabled)return;button.disabled=true;
  try{await fn();}catch(err){toast(err.message);}finally{if(button.isConnected)button.disabled=false;}
 }
+function confirmArchive(nickname){
+ const dialog=document.createElement('dialog');dialog.className='confirm-dialog';
+ dialog.setAttribute('aria-labelledby','archive-title');
+ dialog.innerHTML=`<h2 id="archive-title">删除“${esc(nickname)}”这个档案？</h2><p>聊天和记录会一起移到已删除档案，之后可以恢复。</p><form method="dialog"><button class="button" value="cancel" autofocus>取消</button><button class="button danger" value="confirm">确认删除</button></form>`;
+ document.body.append(dialog);
+ return new Promise(resolve=>{dialog.addEventListener('close',()=>{const confirmed=dialog.returnValue==='confirm';dialog.remove();resolve(confirmed);},{once:true});dialog.showModal();});
+}
 async function memoryAction(id,action){await api('/api/cards/'+encodeURIComponent(id),{childId:state.id,action,expectedVersion:state.data.memories.find(m=>m.id===id)?.version},'PATCH');await sync();toast({withdraw:'提醒或记录已撤回，下次回答不再使用。',delete:'记录已删除，可从回收站恢复。',restore:'已恢复之前的版本。'}[action]||'已保存。');}
 app.addEventListener('input',e=>{if(e.target.id==='question')localStorage.setItem(draftKey(),e.target.value);});
 app.addEventListener('keydown',e=>{if(e.target.id==='question'&&e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();e.target.closest('form').requestSubmit();}});
@@ -202,7 +209,7 @@ app.addEventListener('click',async e=>{
   else if(action==='summarize'){const result=await api('/api/conversations/summary',{childId:state.id,conversationId:button.dataset.conversation});await sync();toast(result.message||(result.status==='pending'?'正在整理，完成后会出现在这里。':'探索记录已经是当前版本。'));}
   else if(action.endsWith('-memory'))await memoryAction(button.dataset.memory,{'withdraw-memory':'withdraw','delete-memory':'delete','restore-memory':'restore'}[action]);
   else if(action==='delete-conversation'||action==='restore-conversation'){await api('/api/conversations/delete',{childId:state.id,conversationId:button.dataset.conversation,restore:action==='restore-conversation'});await sync();nav(action==='delete-conversation'?'/memory':'/memory?conversation='+encodeURIComponent(button.dataset.conversation));toast(action==='delete-conversation'?'会话与关联记忆已删除，可从回收站恢复。':'会话已恢复。');}
-  else if(action==='archive-profile'){if(state.data?.pending||state.sending)await stop();await api('/api/profiles/archive',{childId:state.id});state.id='';state.data=null;localStorage.removeItem(selectionKey);await initialize();nav('/setup?new=1');toast('档案已删除，可以从已删除档案恢复。');}
+  else if(action==='archive-profile'){const childId=state.id;if(!await confirmArchive(current().nickname)||state.id!==childId)return;if(state.data?.pending||state.sending)await stop();await api('/api/profiles/archive',{childId});state.id='';state.data=null;localStorage.removeItem(selectionKey);await initialize();nav('/setup?new=1');toast('档案已删除，可以从已删除档案恢复。');}
   else if(action==='restore-profile'){await api('/api/profiles/archive',{childId:button.dataset.profile,restore:true});state.id=button.dataset.profile;state.testing=state.profiles.find(p=>p.id===state.id)?.kind==='test';localStorage.setItem('curiosity-test-mode',state.testing?'1':'0');localStorage.setItem(selectionKey,state.id);await sync();nav('/setup');toast('档案和记录已恢复。');}
  });
 });
