@@ -1,0 +1,337 @@
+"""Isolated parent conversation, using read-only child evidence projections.
+
+Only save_draft crosses into the existing child mutation API, on an explicit click.
+Model I/O always runs outside JsonStore transactions. No child state repair here.
+"""
+import copy
+import json
+import re
+import threading
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from memory_support import (active, validity, version, reference, dependencies_valid,
+                            exploration_valid, exploration_view, memory_view)
+
+TZ = ZoneInfo("Asia/Shanghai")
+
+
+class ParentService:
+    def __init__(self, service):
+        self.service, self.store, self.model = service, service.store, service.model
+        self.save_lock = threading.Lock()
+        with self.store.transaction() as db:
+            for key in ("parentMessages", "parentRequests"):
+                db.setdefault(key, {})
+            for r in db["parentRequests"].values():
+                if r["status"] == "pending":
+                    r.update(status="failed", error="服务已重启，家长的问题保留了，可以重试。")
+
+    @staticmethod
+    def error(text, status=400, code="parent_request"):
+        from companion import ProductError
+        return ProductError(text, status, code)
+
+    def valid_result(self, db, result, child_id):
+        blocked, _ = validity(db, child_id)
+        return (dependencies_valid(db, result.get("memoryVersions", []), child_id)
+                and all((m := db["messages"].get(mid, {})).get("childId") == child_id
+                        and mid not in blocked and not m.get("deleted")
+                        and not db["conversations"].get(m.get("conversationId"), {}).get("deleted")
+                        for mid in result.get("sourceMessageIds", [])))
+
+    def source(self, db, source_id, child_id):
+        blocked, invalid = validity(db, child_id)
+        m = db["messages"].get(source_id, {})
+        if (m.get("childId") == child_id and source_id not in blocked and not m.get("deleted")
+                and not db["conversations"].get(m.get("conversationId"), {}).get("deleted")):
+            return {"id": source_id, "label": "孩子原话" if m["role"] == "user" else "当时的回答",
+                    "quote": m.get("text", "")[:100], "createdAt": m.get("createdAt"),
+                    "url": "/memory?conversation=" + m["conversationId"] + "&source=" + source_id}
+        item = db["memoryItems"].get(source_id, {})
+        if source_id not in invalid and active(item, child_id, item.get("conversationId")):
+            return {"id": source_id, "label": "提醒" if item["kind"] == "reminder" else "对话记录",
+                    "quote": item.get("summary", "")[:100], "createdAt": item.get("updatedAt"),
+                    "url": "/memory?memory=" + source_id}
+        return None
+
+    def snapshot(self, child_id):
+        db = self.store.read()
+        self.service.profile(db, child_id)
+        messages = sorted((m for m in db["parentMessages"].values() if m["childId"] == child_id), key=lambda m: m["createdAt"])
+        latest_activity = next((m for m in reversed(messages) if m.get("activity")), None)
+        activity = None
+        if latest_activity and self.valid_result(db, latest_activity, child_id):
+            activity = {**latest_activity["activity"], "createdAt": latest_activity["createdAt"],
+                        "url": "/parent?view=ask#parent-" + latest_activity["id"]}
+        visible = []
+        for m in messages[-40:]:
+            value = {k: copy.deepcopy(m[k]) for k in ("id", "role", "text", "advice", "activity", "draft", "createdAt", "requestId", "timeWindow", "partial") if k in m}
+            value["stale"] = m["role"] == "assistant" and not self.valid_result(db, m, child_id)
+            source_ids = m.get("sources", [])
+            if m.get("activity") and not source_ids:
+                # A material-only follow-up keeps its previous activity's real
+                # dependencies. Keep those inspectable even with no new quotes.
+                source_ids = ([r["id"] for r in m.get("memoryVersions", [])] + m.get("sourceMessageIds", []))[:4]
+            value["sources"] = [s for sid in source_ids if (s := self.source(db, sid, child_id))]
+            if value["stale"]:
+                value["activity"] = None
+                if (value.get("draft") or {}).get("status") == "pending" and value["draft"].get("action") == "add":
+                    value["draft"] = None
+            visible.append(value)
+        requests = [r for r in db["parentRequests"].values() if r["childId"] == child_id]
+        return {"messages": visible, "activity": activity,
+                "pending": next((r for r in requests if r["status"] == "pending"), None),
+                "lastRequest": requests[-1] if requests else None}
+
+    def begin(self, data):
+        from companion import identifier, stamp
+        child_id, rid = str(data.get("childId", "")), str(data.get("requestId", ""))
+        text = str(data.get("text", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", rid) or not text or len(text) > 1000:
+            raise self.error("请填写1000字以内的家长问题。")
+        with self.store.transaction() as db:
+            self.service.profile(db, child_id)
+            old = db["parentRequests"].get(rid)
+            if old:
+                if old["childId"] != child_id or old["text"] != text:
+                    raise self.error("这次请求与原问题不一致。", 409)
+                return copy.deepcopy(old)
+            if any(r["childId"] == child_id and r["status"] == "pending" for r in db["parentRequests"].values()):
+                raise self.error("这个档案还有一个家长问题正在回答，请稍候或停止。", 409)
+            record_id = str(data.get("recordId") or "")
+            if record_id and not self.source(db, record_id, child_id):
+                raise self.error("这条依据不可用，请从当前档案重新选择。", 404)
+            mid = identifier("parent")
+            db["parentMessages"][mid] = {"id": mid, "childId": child_id, "role": "user", "text": text, "requestId": rid, "createdAt": stamp()}
+            request = {"id": rid, "childId": child_id, "text": text, "recordId": record_id, "status": "pending", "createdAt": stamp()}
+            db["parentRequests"][rid] = request
+        threading.Thread(target=self.work, args=(copy.deepcopy(request),), name="parent-answer", daemon=True).start()
+        return request
+
+    def cancel(self, data):
+        with self.store.transaction() as db:
+            self.service.profile(db, data.get("childId"))
+            r = db["parentRequests"].get(data.get("requestId"), {})
+            if r.get("childId") != data.get("childId"):
+                raise self.error("没有找到这次家长提问。", 404)
+            if r["status"] == "pending":
+                r["status"] = "cancelled"
+            return {"status": r["status"]}
+
+    @staticmethod
+    def window(selection, now):
+        today = now.astimezone(TZ).date()
+        mode = selection.get("mode")
+        if mode == "all":
+            return None, today, "全部历史（本次仅选取相关记录）"
+        if mode == "recent":
+            first, last = today - timedelta(days=6), today
+        elif mode == "range":
+            first, last = (datetime.strptime(selection[k], "%Y-%m-%d").date() for k in ("fromDate", "toDate"))
+            if first > last:
+                raise ValueError("日期范围无效")
+        else:
+            raise ValueError("未识别时间范围")
+        return first, last, f"{first.isoformat()} 至 {last.isoformat()}"
+
+    @staticmethod
+    def within(value, first, last):
+        try:
+            day = datetime.fromisoformat(value).astimezone(TZ).date()
+            return (first is None or day >= first) and day <= last
+        except (ValueError, TypeError):
+            return False
+
+    def context(self, request):
+        child_id = request["childId"]
+        db = self.store.read()
+        profile = self.service.profile(db, child_id)
+        blocked, invalid = validity(db, child_id)
+        records = sorted((m for m in db["memoryItems"].values() if m["id"] not in invalid and active(m, child_id, m.get("conversationId"))), key=lambda m: m.get("updatedAt", ""), reverse=True)
+        conversations = sorted((c for c in db["conversations"].values() if c.get("childId") == child_id and not c.get("deleted")), key=lambda c: c["startedAt"], reverse=True)
+        raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
+        history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
+        directory = {"records": [memory_view(m) for m in records[:40]], "conversations": []}
+        for c in conversations[:40]:
+            msgs = [m for m in raw if m["conversationId"] == c["id"]]
+            directory["conversations"].append({"id": c["id"], "topic": c.get("title"), "startedAt": c["startedAt"],
+                "lastAt": msgs[-1]["createdAt"] if msgs else c["startedAt"],
+                "questions": [m["text"][:120] for m in msgs if m["role"] == "user"][-8:]})
+        partial = len(records) > 40 or len(conversations) > 40
+        while len(json.dumps(directory, ensure_ascii=False).encode()) > 18000:
+            key = max(directory, key=lambda k: len(json.dumps(directory[k], ensure_ascii=False)))
+            directory[key].pop()
+            partial = True
+        now = datetime.now(TZ)
+        selected, _ = self.model.complete({"now": now.isoformat(), "question": request["text"],
+            "recordId": request.get("recordId"), "directory": directory, "partial": partial,
+            "parentHistory": [{"role": m["role"], "text": m["text"][:500]} for m in history]}, request["id"], purpose="parent_select")
+        first, last, label = self.window(selected, now)
+        evidence, refs, message_ids = {}, {}, set()
+
+        def add_message(m):
+            if m["id"] in evidence:
+                return
+            evidence[m["id"]] = {"id": m["id"], "type": "message", "role": m["role"], "text": m["text"][:1600], "createdAt": m["createdAt"]}
+            message_ids.add(m["id"])
+
+        def add_record(m):
+            evidence[m["id"]] = {**memory_view(m, True), "type": "record"}
+            refs[m["id"]] = reference(m)
+            for mid in m.get("sourceMessageIds", []):
+                msg = next((x for x in raw if x["id"] == mid), None)
+                if msg and self.within(msg["createdAt"], first, last):
+                    add_message(msg)
+
+        chosen_records = set(selected.get("memoryIds", [])[:6]) & {m["id"] for m in directory["records"]}
+        if request.get("recordId"):
+            chosen_records.add(request["recordId"])
+        for m in records:
+            if m["id"] not in chosen_records:
+                continue
+            # A parent correction blocks the old answer/interpretation, but the
+            # current edited record still has dated provenance. Do not discard
+            # the corrected record merely because its old source is blocked.
+            dates = [x.get("createdAt") for x in db["messages"].values()
+                     if x["id"] in m.get("sourceMessageIds", []) and x.get("childId") == child_id and not x.get("deleted")]
+            if m["kind"] == "reminder" or any(self.within(d, first, last) for d in dates):
+                add_record(m)
+        selected_convs = set(selected.get("conversationIds", [])[:4]) & {c["id"] for c in directory["conversations"]}
+        summaries = []
+        for c in conversations:
+            if c["id"] not in selected_convs:
+                continue
+            msgs = [m for m in raw if m["conversationId"] == c["id"] and self.within(m["createdAt"], first, last)]
+            if len(msgs) > 20:
+                partial = True
+            for m in msgs[-20:]:
+                add_message(m)
+            exp = c.get("exploration", {})
+            if exploration_valid(db, c, blocked) and set(exp.get("sourceMessageIds", [])).issubset(message_ids):
+                view = exploration_view(db, exp)
+                summaries.append({k: view.get(k) for k in ("topic", "focus", "difficulties", "attempts", "openQuestions")})
+                for r in exp.get("memoryVersions", []):
+                    add_record(db["memoryItems"][r["id"]])
+        previous_activity = None
+        if selected.get("inheritActivity"):
+            previous = next((m for m in reversed(history) if m.get("activity")), None)
+            if previous and all(self.within(db["messages"].get(mid, {}).get("createdAt"), first, last) for mid in previous.get("sourceMessageIds", [])):
+                previous_activity = previous["activity"]
+                for r in previous.get("memoryVersions", []):
+                    add_record(db["memoryItems"][r["id"]])
+                for mid in previous.get("sourceMessageIds", []):
+                    add_message(db["messages"][mid])
+        context = {"question": request["text"], "child": {"nickname": profile["nickname"], "age": profile["age"]},
+                   "timeWindow": label, "partial": partial, "evidence": list(evidence.values()), "summaries": summaries,
+                   "parentHistory": [{"role": m["role"], "text": m["text"][:600]} for m in history], "previousActivity": previous_activity}
+        if len(json.dumps(context, ensure_ascii=False).encode()) > 28000:
+            raise self.error("相关记录较多，请缩小到一个话题或时间段再问。", 400, "parent_capacity")
+        inherited = ({"memoryVersions": previous.get("memoryVersions", []), "sourceMessageIds": previous.get("sourceMessageIds", [])}
+                     if previous_activity else {"memoryVersions": [], "sourceMessageIds": []})
+        return context, {"memoryVersions": list(refs.values()), "sourceMessageIds": sorted(message_ids), "timeWindow": label, "partial": partial,
+                         "inheritedActivity": inherited}, evidence
+
+    def work(self, request):
+        from companion import identifier, stamp, safe_suggestion
+        try:
+            context, dependencies, evidence = self.context(request)
+            # Snapshot again after selection; never spend on an already stopped query.
+            current = self.store.read()
+            if self.service.closed.is_set() or current["parentRequests"][request["id"]]["status"] != "pending":
+                return
+            self.service.profile(current, request["childId"])
+            if not self.valid_result(current, dependencies, request["childId"]):
+                raise self.error("依据刚有更新，请重新提问。", 409)
+            result, meta = self.model.complete(context, request["id"], purpose="parent_answer")
+            answer = str(result.get("answer") or "").strip()
+            if not answer or len(answer) > 4000:
+                raise self.error("这次回答没有完整生成，请重试。", 502)
+            sources = list(dict.fromkeys(result.get("sources", [])))[:4]
+            used = set(result.get("usedEvidenceIds", [])) | set(sources)
+            if any(s not in evidence for s in used):
+                raise self.error("这次回答的依据未能核对，请重试。", 502, "parent_sources")
+            activity = result.get("activity")
+            if activity:
+                if not all(isinstance(activity.get(k), str) and activity[k].strip() for k in ("title", "materials", "steps", "adultAction", "why")):
+                    raise self.error("活动步骤尚不完整，可以重新问一个更简单的活动。", 502)
+                check = safe_suggestion({"title": activity["title"], "steps": "\n".join(activity[k] for k in ("materials", "steps", "adultAction")), "why": activity["why"]})
+                if not check:
+                    raise self.error("这项活动暂不适合直接操作，请换一个更简单的桌边观察。", 422)
+            draft = result.get("draft")
+            if draft:
+                if draft.get("action") not in ("add", "edit") or not 0 < len(str(draft.get("summary", "")).strip()) <= 300:
+                    raise self.error("提醒草稿没有完整生成，请重新说明。", 502)
+                if draft["action"] == "edit":
+                    target = evidence.get(draft.get("memoryId"), {})
+                    if target.get("type") != "record":
+                        raise self.error("未能定位要修改的记录，请从记忆详情修改。", 409)
+                    draft["expectedVersion"] = target["version"]
+                else:
+                    draft["memoryId"] = ""
+                draft["status"] = "pending"
+                if draft["action"] == "edit":
+                    used.add(draft["memoryId"])
+            inherited = dependencies.pop("inheritedActivity") if activity else {"memoryVersions": [], "sourceMessageIds": []}
+            dependencies.pop("inheritedActivity", None)
+            refs = {r["id"]: r for r in dependencies["memoryVersions"] if r["id"] in used}
+            refs.update({r["id"]: r for r in inherited["memoryVersions"]})
+            dependencies["memoryVersions"] = list(refs.values())
+            dependencies["sourceMessageIds"] = sorted(set(dependencies["sourceMessageIds"]) & used | set(inherited["sourceMessageIds"]))
+            with self.store.transaction() as db:
+                r = db["parentRequests"][request["id"]]
+                if r["status"] != "pending" or self.service.closed.is_set():
+                    return
+                self.service.profile(db, request["childId"])
+                if not self.valid_result(db, dependencies, request["childId"]):
+                    raise self.error("依据刚有更新，请重新提问。", 409)
+                mid = identifier("parent")
+                db["parentMessages"][mid] = {"id": mid, "childId": request["childId"], "role": "assistant", "text": answer,
+                    "advice": str(result.get("advice") or "")[:2000], "sources": sources, "activity": activity, "draft": draft,
+                    "requestId": r["id"], "createdAt": stamp(), "model": meta.get("model"), **dependencies}
+                r.update(status="completed", finishedAt=stamp())
+        except Exception as exc:
+            from companion import ProductError
+            with self.store.transaction() as db:
+                r = db["parentRequests"].get(request["id"], {})
+                if r.get("status") == "pending":
+                    r.update(status="failed", error=str(exc) if isinstance(exc, ProductError) else "这次没有回答完成，原问题保留了，请重试。", finishedAt=stamp())
+
+    def save_draft(self, data):
+        """One explicit save, reusing child validation/versioning/invalidation.
+
+        A persisted saving marker prevents duplicate adds after an uncertain crash;
+        a known validation conflict is retryable. No second memory version system.
+        """
+        from companion import ProductError, stamp
+        child_id, mid = data.get("childId"), data.get("messageId")
+        with self.save_lock:
+            with self.store.transaction() as db:
+                self.service.profile(db, child_id)
+                m = db["parentMessages"].get(mid, {})
+                draft = m.get("draft")
+                if m.get("childId") != child_id or not draft:
+                    raise self.error("没有找到这个档案的提醒草稿。", 404)
+                if draft["status"] == "saved":
+                    return {"memoryId": draft["savedMemoryId"], "status": "saved"}
+                if draft["status"] != "pending":
+                    raise self.error("上次保存结果尚未确认，请先到记忆与提醒查看，避免重复添加。", 409)
+                if draft["action"] == "add" and not self.valid_result(db, m, child_id):
+                    raise self.error("草稿依据已经变化，请重新整理提醒。", 409)
+                payload = {"childId": child_id, "summary": data.get("summary"), "topic": data.get("topic", draft.get("topic", "")),
+                           "scope": data.get("scope", draft.get("scope")), "action": "edit",
+                           "expectedVersion": data.get("expectedVersion", draft.get("expectedVersion"))}
+                saved_draft = copy.deepcopy(draft)
+                draft["status"] = "saving"
+            try:
+                if saved_draft["action"] == "edit":
+                    item = self.service.update_memory(saved_draft["memoryId"], payload)
+                else:
+                    item = self.service.add_reminder(payload)
+            except ProductError:
+                with self.store.transaction() as db:
+                    db["parentMessages"][mid]["draft"]["status"] = "pending"
+                raise
+            with self.store.transaction() as db:
+                db["parentMessages"][mid]["draft"].update(status="saved", savedMemoryId=item["id"], savedAt=stamp(), summary=item["summary"])
+            return {"memoryId": item["id"], "status": "saved"}

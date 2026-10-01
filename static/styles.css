@@ -188,3 +188,47 @@ form textarea{resize:vertical;line-height:1.7}
  .empty{padding:35px 18px}.toast{bottom:16px;font-size:12px}.trash-row{gap:12px}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+/* Parent views share the existing shell and detail routes. */
+.record-list .record-row{display:flex;align-items:flex-start;gap:20px;padding:17px 0;min-height:0}
+.record-list .record-row>p{flex:1;margin:0;line-height:1.7}
+.record-list .record-row>a{flex:none;padding:3px 0;white-space:nowrap}
+.memory-group+ .memory-group{border-top:1px solid var(--line,#e1e7e5);padding-top:20px;margin-top:6px}
+.memory-group h2{font-size:16px;margin:0;color:#526861}
+.parent-activity{margin-bottom:24px}
+.parent-activity h2{font-size:20px;margin-top:0}
+.parent-activity dl{margin:14px 0;display:grid;grid-template-columns:80px 1fr;gap:10px 14px;line-height:1.7}
+.parent-activity dt{color:#526861;font-weight:600}
+.parent-activity dd{margin:0;white-space:pre-wrap}
+.parent-activity>p{white-space:pre-wrap}
+.activity-entry{margin:0 0 24px}
+.parent-chat{max-width:900px}
+.parent-examples{display:flex;flex-wrap:wrap;gap:8px 18px;padding-bottom:14px;border-bottom:1px solid #e5ebe8}
+.parent-examples button{font:inherit;font-size:14px;color:#366653;background:transparent;border:0;padding:3px 0;text-align:left;cursor:pointer}
+.parent-log{max-height:56vh;overflow-y:auto;overscroll-behavior:contain;padding-right:6px;margin-bottom:18px}
+.parent-message{padding:20px 0;border-bottom:1px solid #edf0ee;overflow-wrap:anywhere}
+.parent-message.user{padding-bottom:8px;border-bottom:0}
+.parent-speaker{font-size:13px;color:#597166;margin:0 0 8px;font-weight:600}
+.parent-speaker time{font-weight:400;color:#7b8780;margin-left:8px}
+.parent-text{white-space:pre-wrap;line-height:1.85;margin:0 0 12px}
+.parent-message.user .parent-text{font-weight:600}
+.parent-sources summary{cursor:pointer;color:#47715d;font-size:14px}
+.parent-sources a{display:block;margin:10px 0;padding-left:12px;border-left:2px solid #dae5dd;text-decoration:none}
+.parent-sources a span,.parent-sources q{display:block;line-height:1.6;font-size:14px}
+.parent-sources a span{color:#77867a;font-size:12px}
+.parent-draft{padding:18px;background:#f5f8f5;border-radius:12px;margin:14px 0 4px}
+.parent-draft h3,.parent-advice h3{font-size:16px;margin:0 0 6px}
+.parent-draft details{margin-bottom:14px}
+.parent-draft-form .button{margin-top:8px}
+.parent-draft-form label{display:block;margin:12px 0 5px}
+.parent-draft-form input,.parent-draft-form textarea,.parent-draft-form select{margin-top:6px;width:100%}
+.parent-compose-footer{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-top:10px}
+#parentQuestion{width:100%;resize:vertical;min-height:80px}
+.parent-context{padding:10px 12px;background:#f5f8f5;line-height:1.7}
+.parent-context a{white-space:nowrap;margin-left:8px}
+.saved-reminder{color:#366653;font-size:14px}
+@media(max-width:600px){
+ .parent-tabs{gap:18px}.parent-tabs a{white-space:nowrap}
+ .parent-activity dl{grid-template-columns:1fr;gap:3px}.parent-activity dd{margin-bottom:12px}
+ .parent-chat{padding:18px}.parent-log{max-height:52vh}.parent-draft{padding:14px}
+ .parent-compose-footer .muted{font-size:13px}.record-list .record-row{gap:14px}
+}

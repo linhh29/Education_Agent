@@ -23,6 +23,7 @@ from urllib.request import Request, build_opener, HTTPSHandler, ProxyHandler, HT
 from memory_support import (TASKS, MAX_CATALOG_RECORDS, MAX_CATALOG_BYTES, active, version,
     reference, dependencies_valid, blocked_messages, exploration_valid, memory_view,
     summary_input, validate_summary, exploration_view, validity, effective_scope)
+from parent_prompts import PARENT_TASKS
 
 
 def stamp():
@@ -205,7 +206,7 @@ class ModelClient:
 
     def complete(self, context, request_id, purpose="chat"):
         c, b = self.config, self.config["budget"]
-        task = TASKS.get(purpose)
+        task = TASKS.get(purpose) or PARENT_TASKS.get(purpose)
         if purpose != "chat" and not task:
             raise ProductError("不支持这项模型任务。")
         prompt, schema = (task["prompt"], task["schema"]) if task else (SYSTEM_PROMPT, REPLY_SCHEMA)
@@ -326,6 +327,8 @@ class CompanionService:
                     request.update(status="failed", error="服务已重启，问题保留了，请重试。", code="server_restarted")
                     if request.get("userMessageId") in db["messages"]:
                         db["messages"][request["userMessageId"]]["status"] = "failed"
+        from parent_support import ParentService
+        self.parent = ParentService(self)
 
     @staticmethod
     def invalidate_pending(db, child_id):
@@ -853,6 +856,8 @@ class CompanionService:
             return {"ok": True}
 
     def get(self, path, params):
+        if path == "/api/parent/state":
+            return self.parent.snapshot(params.get("childId", [""])[0])
         if path == "/api/status":
             return {**self.model.public_status(), "speech": self.speech.public_status()}
         if path == "/api/speech/request":
@@ -873,6 +878,12 @@ class CompanionService:
         raise ProductError("没有这个接口。", 404)
 
     def mutate(self, path, data, method="POST"):
+        if path == "/api/parent/ask":
+            return self.parent.begin(data)
+        if path == "/api/parent/cancel":
+            return self.parent.cancel(data)
+        if path == "/api/parent/save":
+            return self.parent.save_draft(data)
         if path in ("/api/speech/transcribe", "/api/speech/synthesize"):
             return self.speech.begin("asr" if path.endswith("transcribe") else "tts", data)
         if path == "/api/speech/cancel":
