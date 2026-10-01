@@ -7,13 +7,24 @@ import copy
 import json
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import calendar
 from zoneinfo import ZoneInfo
 
 from memory_support import (active, validity, version, reference, dependencies_valid,
                             exploration_valid, exploration_view, memory_view)
 
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+def local_time(value):
+    """Parent-only display/projection; leave persisted child timestamps intact."""
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("缺少时间的时区")
+    return parsed.astimezone(TZ).isoformat(timespec="seconds")
 
 
 class ParentService:
@@ -59,7 +70,7 @@ class ParentService:
         db = self.store.read()
         self.service.profile(db, child_id)
         messages = sorted((m for m in db["parentMessages"].values() if m["childId"] == child_id), key=lambda m: m["createdAt"])
-        latest_activity = next((m for m in reversed(messages) if m.get("activity")), None)
+        latest_activity = self.current_activity(db, child_id)
         activity = None
         if latest_activity and self.valid_result(db, latest_activity, child_id):
             activity = {**latest_activity["activity"], "createdAt": latest_activity["createdAt"],
@@ -83,6 +94,13 @@ class ParentService:
         return {"messages": visible, "activity": activity,
                 "pending": next((r for r in requests if r["status"] == "pending"), None),
                 "lastRequest": requests[-1] if requests else None}
+
+    def current_activity(self, db, child_id):
+        # One existing object, independently of the bounded dialogue tail.
+        # Never fall back to an older activity if the newest one is invalid.
+        latest = next((m for m in reversed(list(db["parentMessages"].values()))
+                       if m["childId"] == child_id and (m.get("activity") or m.get("activityReset"))), None)
+        return latest if latest and latest.get("activity") and self.valid_result(db, latest, child_id) else None
 
     def begin(self, data):
         from companion import identifier, stamp
@@ -120,25 +138,57 @@ class ParentService:
             return {"status": r["status"]}
 
     @staticmethod
-    def window(selection, now):
+    def window(selection, now, question="", previous=None):
         today = now.astimezone(TZ).date()
         mode = selection.get("mode")
         if mode == "all":
+            quote = selection.get("timeQuote", "")
+            if not quote or quote not in question:
+                raise ValueError("请明确要查看的时间范围")
             return None, today, "全部历史（本次仅选取相关记录）"
         if mode == "recent":
-            first, last = today - timedelta(days=6), today
+            days = int(selection.get("days", 7))
+            if not 1 <= days <= 366:
+                raise ValueError("请缩小查询时间范围")
+            first, last = today - timedelta(days=days - 1), today
+        elif mode in ("day", "week", "month"):
+            offset = int(selection.get("offset", 0))
+            if not -366 <= offset <= 0:
+                raise ValueError("请明确过去的查询时间范围")
+            if mode == "day":
+                first = last = today + timedelta(days=offset)
+            elif mode == "week":
+                first = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+                last = min(first + timedelta(days=6), today)
+            else:
+                year, month = divmod(today.year * 12 + today.month - 1 + offset, 12)
+                first = date(year, month + 1, 1)
+                last = min(date(year, month + 1, calendar.monthrange(year, month + 1)[1]), today)
+        elif mode == "previous" and previous:
+            first = date.fromisoformat(previous["from"]) if previous.get("from") else None
+            last = date.fromisoformat(previous["to"])
         elif mode == "range":
-            first, last = (datetime.strptime(selection[k], "%Y-%m-%d").date() for k in ("fromDate", "toDate"))
+            quote = selection.get("timeQuote", "")
+            if not quote or quote not in question:
+                raise ValueError("请明确起止日期")
+            def explicit_day(value):
+                # Missing year means this application year, never model recall.
+                if re.fullmatch(r"\d{2}-\d{2}", value):
+                    value = f"{today.year}-{value}"
+                elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) or value[:4] not in quote:
+                    raise ValueError("请说明年份或使用今天、昨天、上周等范围")
+                return date.fromisoformat(value)
+            first, last = (explicit_day(selection[k]) for k in ("fromDate", "toDate"))
             if first > last:
                 raise ValueError("日期范围无效")
         else:
-            raise ValueError("未识别时间范围")
-        return first, last, f"{first.isoformat()} 至 {last.isoformat()}"
+            raise ValueError("请说明希望查看哪段时间，例如最近一周或具体日期")
+        return first, last, f"{first.isoformat() if first else '记录起始'} 至 {last.isoformat()}（Asia/Shanghai）"
 
     @staticmethod
     def within(value, first, last):
         try:
-            day = datetime.fromisoformat(value).astimezone(TZ).date()
+            day = datetime.fromisoformat(local_time(value)).date()
             return (first is None or day >= first) and day <= last
         except (ValueError, TypeError):
             return False
@@ -152,32 +202,45 @@ class ParentService:
         conversations = sorted((c for c in db["conversations"].values() if c.get("childId") == child_id and not c.get("deleted")), key=lambda c: c["startedAt"], reverse=True)
         raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
         history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
-        directory = {"records": [memory_view(m) for m in records[:40]], "conversations": []}
+        current_activity = self.current_activity(db, child_id)
+        def record_view(m, include_quote=False):
+            value = memory_view(m, include_quote)
+            value["updatedAt"] = local_time(m.get("updatedAt"))
+            value["sourceOccurredAt"] = [local_time(db["messages"][mid]["createdAt"]) for mid in m.get("sourceMessageIds", [])
+                if mid in db["messages"] and db["messages"][mid].get("childId") == child_id and db["messages"][mid].get("role") == "user" and not db["messages"][mid].get("deleted")]
+            return value
+        directory = {"records": [record_view(m) for m in records[:40]], "conversations": []}
         for c in conversations[:40]:
             msgs = [m for m in raw if m["conversationId"] == c["id"]]
-            directory["conversations"].append({"id": c["id"], "topic": c.get("title"), "startedAt": c["startedAt"],
-                "lastAt": msgs[-1]["createdAt"] if msgs else c["startedAt"],
+            directory["conversations"].append({"id": c["id"], "topic": c.get("title"), "startedAt": local_time(c["startedAt"]),
+                "lastAt": local_time(msgs[-1]["createdAt"] if msgs else c["startedAt"]),
                 "questions": [m["text"][:120] for m in msgs if m["role"] == "user"][-8:]})
         partial = len(records) > 40 or len(conversations) > 40
         while len(json.dumps(directory, ensure_ascii=False).encode()) > 18000:
             key = max(directory, key=lambda k: len(json.dumps(directory[k], ensure_ascii=False)))
             directory[key].pop()
             partial = True
-        now = datetime.now(TZ)
+        now = datetime.fromisoformat(request["createdAt"]).astimezone(TZ)
+        previous_window = next((m.get("dateWindow") for m in reversed(history) if m.get("dateWindow")), None)
         selected, _ = self.model.complete({"now": now.isoformat(), "question": request["text"],
             "recordId": request.get("recordId"), "directory": directory, "partial": partial,
+            "currentActivity": current_activity["activity"] if current_activity else None,
+            "previousWindow": previous_window,
             "parentHistory": [{"role": m["role"], "text": m["text"][:500]} for m in history]}, request["id"], purpose="parent_select")
-        first, last, label = self.window(selected, now)
+        try:
+            first, last, label = self.window(selected, now, request["text"], previous_window)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise self.error(str(exc), 400, "parent_time_range")
         evidence, refs, message_ids = {}, {}, set()
 
         def add_message(m):
             if m["id"] in evidence:
                 return
-            evidence[m["id"]] = {"id": m["id"], "type": "message", "role": m["role"], "text": m["text"][:1600], "createdAt": m["createdAt"]}
+            evidence[m["id"]] = {"id": m["id"], "type": "message", "role": m["role"], "text": m["text"][:1600], "createdAt": local_time(m["createdAt"])}
             message_ids.add(m["id"])
 
         def add_record(m):
-            evidence[m["id"]] = {**memory_view(m, True), "type": "record"}
+            evidence[m["id"]] = {**record_view(m, True), "type": "record"}
             refs[m["id"]] = reference(m)
             for mid in m.get("sourceMessageIds", []):
                 msg = next((x for x in raw if x["id"] == mid), None)
@@ -194,7 +257,7 @@ class ParentService:
             # current edited record still has dated provenance. Do not discard
             # the corrected record merely because its old source is blocked.
             dates = [x.get("createdAt") for x in db["messages"].values()
-                     if x["id"] in m.get("sourceMessageIds", []) and x.get("childId") == child_id and not x.get("deleted")]
+                     if x["id"] in m.get("sourceMessageIds", []) and x.get("childId") == child_id and x.get("role") == "user" and not x.get("deleted")]
             if m["kind"] == "reminder" or any(self.within(d, first, last) for d in dates):
                 add_record(m)
         selected_convs = set(selected.get("conversationIds", [])[:4]) & {c["id"] for c in directory["conversations"]}
@@ -214,8 +277,9 @@ class ParentService:
                 for r in exp.get("memoryVersions", []):
                     add_record(db["memoryItems"][r["id"]])
         previous_activity = None
-        if selected.get("inheritActivity"):
-            previous = next((m for m in reversed(history) if m.get("activity")), None)
+        activity_intent = selected.get("activityIntent", "continue" if selected.get("inheritActivity") else "none")
+        if activity_intent == "continue":
+            previous = current_activity
             if previous and all(self.within(db["messages"].get(mid, {}).get("createdAt"), first, last) for mid in previous.get("sourceMessageIds", [])):
                 previous_activity = previous["activity"]
                 for r in previous.get("memoryVersions", []):
@@ -223,6 +287,7 @@ class ParentService:
                 for mid in previous.get("sourceMessageIds", []):
                     add_message(db["messages"][mid])
         context = {"question": request["text"], "child": {"nickname": profile["nickname"], "age": profile["age"]},
+                   "now": now.isoformat(), "timezone": str(TZ), "activityIntent": activity_intent,
                    "timeWindow": label, "partial": partial, "evidence": list(evidence.values()), "summaries": summaries,
                    "parentHistory": [{"role": m["role"], "text": m["text"][:600]} for m in history], "previousActivity": previous_activity}
         if len(json.dumps(context, ensure_ascii=False).encode()) > 28000:
@@ -230,6 +295,8 @@ class ParentService:
         inherited = ({"memoryVersions": previous.get("memoryVersions", []), "sourceMessageIds": previous.get("sourceMessageIds", [])}
                      if previous_activity else {"memoryVersions": [], "sourceMessageIds": []})
         return context, {"memoryVersions": list(refs.values()), "sourceMessageIds": sorted(message_ids), "timeWindow": label, "partial": partial,
+                         "dateWindow": {"from": first.isoformat() if first else None, "to": last.isoformat()},
+                         "activityReset": activity_intent in ("new", "clear"),
                          "inheritedActivity": inherited}, evidence
 
     def work(self, request):
@@ -251,7 +318,9 @@ class ParentService:
             used = set(result.get("usedEvidenceIds", [])) | set(sources)
             if any(s not in evidence for s in used):
                 raise self.error("这次回答的依据未能核对，请重试。", 502, "parent_sources")
-            activity = result.get("activity")
+            # An unrelated query cannot replace the discussion object merely
+            # because the answer model repeats a previously visible activity.
+            activity = result.get("activity") if context["activityIntent"] in ("new", "continue") else None
             if activity:
                 if not all(isinstance(activity.get(k), str) and activity[k].strip() for k in ("title", "materials", "steps", "adultAction", "why")):
                     raise self.error("活动步骤尚不完整，可以重新问一个更简单的活动。", 502)

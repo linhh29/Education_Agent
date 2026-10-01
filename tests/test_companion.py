@@ -9,7 +9,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 import app
-from companion import CompanionService, ModelClient, ProductError
+from companion import CompanionService, ModelClient, ProductError, safe_suggestion
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,6 +48,22 @@ class DialogueTests(unittest.TestCase):
         result = self.chat(self.request())
         self.assertEqual(len(result['snapshot']['messages']),2)
         self.assertEqual(result['snapshot']['memories'],[])
+
+    def test_activity_guard_checks_each_action_not_the_whole_negative_sentence(self):
+        allowed = ['由家长拿叶子，只看，不品尝。', '不要尝或舔叶子，只观察。', '家长拿手电，注意不要照眼睛。', '只看形状，不用刀，也不要点火。']
+        denied = ['先品尝叶子。', '不要品尝叶子，然后尝一下。', '不要舔叶子，但可以品尝。', '不要看而是尝一下。', '不能不品尝。', '由家长点火，孩子不要品尝。', '不要照眼睛，然后把手电照向孩子眼睛。', '不怕开水，倒一点。', '不要品尝，独自在马路边观察。']
+        for steps in allowed + denied:
+            with self.subTest(steps=steps):
+                self.assertEqual(safe_suggestion({'title': '一起观察', 'steps': steps, 'why': '观察'}) is not None, steps in allowed)
+
+    def test_child_activity_uses_the_shared_guard_without_changing_the_answer(self):
+        for steps, allowed in [('由家长拿叶子，只看，不品尝。', True), ('不要品尝，接着尝一下叶子。', False)]:
+            response, meta = self.answer()
+            response['suggestion'] = {'title': '观察叶子', 'steps': steps, 'why': '观察颜色'}
+            result = self.chat(self.request(), (response, meta))
+            answer = result['snapshot']['messages'][-1]
+            self.assertEqual(answer['text'], response['answer'])
+            self.assertEqual(bool(answer.get('suggestion')), allowed)
 
     def test_exact_quote_grounds_memory_and_invalid_quote_is_discarded(self):
         req = self.request('我没明白其中的关系')

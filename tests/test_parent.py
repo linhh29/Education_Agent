@@ -5,10 +5,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest.mock import patch
 
 import app
 from companion import CompanionService, ProductError, stamp
+from parent_support import ParentService
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +39,7 @@ class ParentTests(unittest.TestCase):
     def selector(self, **extra):
         return {'mode': 'recent', 'fromDate': '', 'toDate': '', 'memoryIds': [], 'conversationIds': ['ca'], 'inheritActivity': False, **extra}
 
-    def ask(self, answer=None, selection=None, child=None):
+    def ask(self, answer=None, selection=None, child=None, text='最近怎么样'):
         self.n += 1
         rid = 'parent_test_%08d' % self.n
         contexts = []
@@ -48,7 +50,7 @@ class ParentTests(unittest.TestCase):
             self.assertEqual(purpose, 'parent_answer')
             return answer or self.response(), {'model': 'controlled'}
         with patch.object(self.s.model, 'complete', side_effect=model), patch.object(self.s, 'chat', side_effect=AssertionError('child chat called')):
-            self.s.parent.begin({'childId': child or self.a, 'requestId': rid, 'text': '最近怎么样'})
+            self.s.parent.begin({'childId': child or self.a, 'requestId': rid, 'text': text})
             for _ in range(200):
                 snapshot = self.s.parent.snapshot(child or self.a)
                 if not snapshot['pending']:
@@ -58,7 +60,7 @@ class ParentTests(unittest.TestCase):
 
     def test_read_only_query_and_activity_leave_all_child_state_unchanged(self):
         before = self.child_state()
-        result, contexts = self.ask(self.response(activity={'title': '纸的形状', 'materials': '一张纸', 'steps': '把纸平放，再折起比较。', 'adultAction': '成人帮忙折纸。', 'why': '围绕刚才的问题观察。'}))
+        result, contexts = self.ask(self.response(activity={'title': '纸的形状', 'materials': '一张纸', 'steps': '把纸平放，再折起比较。', 'adultAction': '成人帮忙折纸。', 'why': '围绕刚才的问题观察。'}), self.selector(activityIntent='new'))
         self.assertEqual(result['lastRequest']['status'], 'completed')
         self.assertEqual(self.child_state(), before)
         self.assertEqual([p for p, _ in contexts], ['parent_select', 'parent_answer'])
@@ -70,8 +72,63 @@ class ParentTests(unittest.TestCase):
         evidence = contexts[-1][1]['evidence']
         self.assertEqual([e['id'] for e in evidence], ['uca'])
         self.assertEqual(result['lastRequest']['status'], 'completed')
-        result, contexts = self.ask(self.response(answer='该时段没有可用资料。', sources=[]), self.selector(mode='range', fromDate='2019-01-01', toDate='2019-01-02'))
+        result, contexts = self.ask(self.response(answer='该时段没有可用资料。', sources=[]), self.selector(mode='range', fromDate='2019-01-01', toDate='2019-01-02', timeQuote='2019年1月1日至1月2日'), text='2019年1月1日至1月2日')
         self.assertEqual(contexts[-1][1]['evidence'], [])
+
+    def test_calendar_ranges_use_server_local_date_not_model_year(self):
+        now = datetime.fromisoformat('2026-10-01T16:01:00+00:00')
+        for mode, offset, start, end in [('day', 0, '2026-10-02', '2026-10-02'), ('day', -1, '2026-10-01', '2026-10-01'), ('week', -1, '2026-09-21', '2026-09-27')]:
+            with self.subTest(mode=mode, offset=offset):
+                first, last, _ = ParentService.window({'mode': mode, 'offset': offset, 'fromDate': '2025-01-01'}, now)
+                self.assertEqual((str(first), str(last)), (start, end))
+        first, last, _ = ParentService.window({'mode': 'week', 'offset': -1}, datetime.fromisoformat('2027-01-04T00:01:00+08:00'))
+        self.assertEqual((str(first), str(last)), ('2026-12-28', '2027-01-03'))
+        for selected in [{'mode': 'clarify'}, {'mode': 'all'}, {'mode': 'range', 'fromDate': '2025-09-21', 'toDate': '2025-09-27', 'timeQuote': '9月21日至27日'}]:
+            with self.assertRaises(ValueError):
+                ParentService.window(selected, now, '9月21日至27日')
+        first, last, _ = ParentService.window({'mode': 'range', 'fromDate': '09-21', 'toDate': '09-27', 'timeQuote': '9月21日至27日'}, now, '9月21日至27日')
+        self.assertEqual((str(first), str(last)), ('2026-09-21', '2026-09-27'))
+
+    def test_midnight_evidence_and_revision_dates_are_separate_local_times(self):
+        with self.s.store.transaction() as db:
+            db['messages']['uca']['createdAt'] = '2026-10-01T15:59:00+00:00'
+            db['messages']['after'] = {**db['messages']['uca'], 'id': 'after', 'text': '跨日后的提问', 'createdAt': '2026-10-01T16:01:00+00:00'}
+            db['messages']['assistant_next'] = {**db['messages']['after'], 'id': 'assistant_next', 'role': 'assistant', 'text': '跨日后才回答'}
+            db['memoryItems']['revised'] = {'id': 'revised', 'childId': self.a, 'type': 'dialogue_memory', 'kind': 'confusion',
+                'status': 'parent_confirmed', 'summary': '家长更新', 'quote': '我没明白为什么会倒', 'scope': 'conversation', 'conversationId': 'ca',
+                'sourceMessageIds': ['uca', 'assistant_next'], 'version': 2, 'parentEdited': True, 'updatedAt': '2026-10-01T17:00:00+00:00'}
+        request = {'id': 'date_projection', 'childId': self.a, 'text': '今天', 'createdAt': '2026-10-01T16:02:00+00:00'}
+        with patch.object(self.s.model, 'complete', return_value=(self.selector(mode='day', offset=0, memoryIds=['revised']), {})):
+            context, _, _ = self.s.parent.context(request)
+        self.assertEqual([e['id'] for e in context['evidence']], ['after', 'assistant_next'])
+        self.assertEqual(context['evidence'][0]['createdAt'], '2026-10-02T00:01:00+08:00')
+        with patch.object(self.s.model, 'complete', return_value=(self.selector(mode='day', offset=-1, memoryIds=['revised']), {})):
+            context, _, _ = self.s.parent.context(request)
+        record = next(e for e in context['evidence'] if e['id'] == 'revised')
+        self.assertEqual(record['sourceOccurredAt'], ['2026-10-01T23:59:00+08:00'])
+        self.assertEqual(record['updatedAt'], '2026-10-02T01:00:00+08:00')
+
+    def test_activity_survives_dialogue_tail_but_not_replacement_invalidation_or_clear(self):
+        reminder = self.s.add_reminder({'childId': self.a, 'summary': '桌子中间，不用玻璃'})
+        activity = {'title': '纸的形状', 'materials': '纸', 'steps': '在桌子中间折纸。', 'adultAction': '家长折，孩子观察。', 'why': '看形状', 'constraints': ['不用玻璃', '桌子中间', '家长操作']}
+        self.ask(self.response(activity=activity, sources=[reminder['id']]), self.selector(memoryIds=[reminder['id']], activityIntent='new'))
+        for _ in range(4):
+            snapshot, _ = self.ask(self.response(activity={**activity, 'title': '无关回答误带的活动'}), self.selector(activityIntent='none'))
+            self.assertIsNone(snapshot['messages'][-1]['activity'])
+        _, contexts = self.ask(self.response(answer='纸和桌子', sources=[]), self.selector(activityIntent='continue'))
+        self.assertEqual(contexts[0][1]['currentActivity'], activity)
+        self.assertEqual(contexts[-1][1]['previousActivity'], activity)
+        self.assertLessEqual(len(contexts[-1][1]['parentHistory']), 6)
+        self.assertEqual(self.s.parent.snapshot(self.b)['activity'], None)
+        self.s.update_memory(reminder['id'], {'childId': self.a, 'action': 'withdraw'})
+        _, contexts = self.ask(self.response(sources=[]), self.selector(activityIntent='continue'))
+        self.assertIsNone(contexts[-1][1]['previousActivity'])
+        replacement = {**activity, 'title': '新的活动', 'constraints': ['地面观察']}
+        _, contexts = self.ask(self.response(activity=replacement), self.selector(activityIntent='new'))
+        self.assertIsNone(contexts[-1][1]['previousActivity'])
+        self.assertEqual(self.s.parent.snapshot(self.a)['activity']['constraints'], ['地面观察'])
+        self.ask(self.response(answer='好，结束这项活动。'), self.selector(activityIntent='clear'))
+        self.assertIsNone(self.s.parent.snapshot(self.a)['activity'])
 
     def test_foreign_selection_and_fabricated_citation_cannot_escape_profile(self):
         result, contexts = self.ask(self.response(sources=['ucb']), self.selector(conversationIds=['cb']))
@@ -140,7 +197,7 @@ class ParentTests(unittest.TestCase):
         used = self.s.add_reminder({'childId': self.a, 'summary': '轻物，桌边观察'})
         other = self.s.add_reminder({'childId': self.a, 'summary': '另一个无关提醒'})
         activity = {'title': '比较纸的形状', 'materials': '纸', 'steps': '平放与折起比较。', 'adultAction': '成人折纸。', 'why': '围绕提问观察。'}
-        result, _ = self.ask(self.response(activity=activity, sources=[used['id']]), self.selector(memoryIds=[used['id']]))
+        result, _ = self.ask(self.response(activity=activity, sources=[used['id']]), self.selector(memoryIds=[used['id']], activityIntent='new'))
         self.assertIsNotNone(result['activity'])
         self.s.update_memory(other['id'], {'childId': self.a, 'action': 'withdraw'})
         self.assertIsNotNone(self.s.parent.snapshot(self.a)['activity'])

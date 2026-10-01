@@ -298,8 +298,16 @@ def safe_suggestion(raw):
     if not title or not steps or len(steps) > 600:
         return None
     # This narrow guard applies to suggested actions, not normal science answers.
-    if re.search(r"火|插座|电线|开水|刀|药|漂白|清洁剂|吞|尝|舔|直视太阳|照.*眼|独自|马路", title + steps):
-        return None
+    text = title + "\n" + steps
+    for danger in re.finditer(r"火|插座|电线|开水|刀|药|漂白|清洁剂|吞|尝|舔|直视太阳|照.*?眼|独自|马路", text):
+        prefix = re.split(r"[。！？!?；;，,、：:\n]", text[:danger.start()])[-1]
+        # Exempt only this occurrence in a directly negated action, never
+        # a whole sentence/activity. A later affirmative action is checked
+        # separately; double negation does not count as a prohibition.
+        negated = re.search(r"(?:不要|请勿|切勿|禁止|避免|不准|不能|不可|别|勿|不)(?:让(?:孩子|小朋友|家长|成人))?(?:(?:自行|独自|直接|随意|再次|再|去|用|使用|接触|触碰|靠近|点燃|点|品|(?:品尝|吞咽|尝|舔)(?:或|和|及)))*$", prefix)
+        double_negative = re.search(r"(?:不能不|不得不|不要不|不可不|并非不|不是不)", prefix)
+        if not negated or double_negative or re.search(r"[。！？!?；;，,、：:]|然后|随后|接着|但是|而是", danger.group()):
+            return None
     return {"title": title[:60], "steps": steps, "why": why[:240]}
 
 
