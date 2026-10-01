@@ -14,3 +14,6 @@ data/*.lock
 data/*.tmp
 data/local-*.json
 docs/screenshots/
+data/*-speech-cache/
+data/synthetic-audio/
+docs/demo-recordings/

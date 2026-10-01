@@ -8,11 +8,26 @@
   "timeout_seconds": 28,
   "temperature": 0.5,
   "max_input_bytes": 42000,
+  "speech": {
+    "asr_model": "qwen3-asr-flash-2026-02-10",
+    "tts_model": "qwen3-tts-flash-2025-11-27",
+    "asr_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "tts_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "voice": "Serena",
+    "language": "Chinese",
+    "timeout_seconds": 25,
+    "max_recording_seconds": 60,
+    "cache_seconds": 86400,
+    "asr_cny_per_second": 0.00022,
+    "tts_cny_per_10000_characters": 0.8,
+    "limit_cny": 5
+  },
   "budget": {
     "prior_cny": 2.735356,
     "additional_limit_cny": 47,
     "total_limit_cny": 50,
     "input_cny_per_million": 12,
-    "output_cny_per_million": 36
+    "output_cny_per_million": 36,
+    "manual_reserve_cny": 5
   }
 }

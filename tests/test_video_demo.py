@@ -57,10 +57,10 @@ class VideoDemoContractTests(unittest.TestCase):
         self.assertIn(".recording-dock", self.styles)
         self.assertIn(".record-scene", self.styles)
 
-    def test_product_showcase_uses_a_native_navigation_boundary(self):
+    def test_product_does_not_promote_prerecorded_showcase(self):
         product_script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         server = (ROOT / "app.py").read_text(encoding="utf-8")
-        self.assertIn('href="/video-demo" data-native', product_script)
+        self.assertNotIn('href="/video-demo"', product_script)
         self.assertIn("a.hasAttribute('data-native')", product_script)
         self.assertIn('parsed.path == "/video-demo"', server)
         self.assertIn('STATIC_DIR / "video-demo.html"', server)

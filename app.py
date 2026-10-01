@@ -3876,11 +3876,20 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 result = PRODUCT.get(parsed.path, parse_qs(parsed.query))
             else:
-                data = self.read_json()
+                data = self.read_json(3 * 1024 * 1024 if parsed.path == "/api/speech/transcribe" else MAX_BODY)
                 if not isinstance(data, dict):
                     raise ProductError("请求内容格式不正确。")
                 result = PRODUCT.mutate(parsed.path, data, method)
-            self.send_json(result)
+            if isinstance(result, bytes):
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Length", str(len(result)))
+                self.end_headers()
+                self.wfile.write(result)
+            else:
+                self.send_json(result)
         except ProductError as exc:
             self.send_json({"error": exc.code, "message": str(exc)}, exc.status)
         except (ValueError, TypeError):

@@ -1,7 +1,7 @@
 """The product's single-call dialogue and transactional local records.
 
-Uses the existing app's database and server. No paid services except the configured
-text model. Credentials are read only at the backend's request boundary.
+Uses the existing app's database and server. Approved text and speech services
+share a ledger. Credentials are read only at the backend's request boundary.
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ FEEDBACK_ACTIONS = {
 
 
 SYSTEM_PROMPT = """你是“好奇心伙伴”，给4–7岁孩子的AI对话伙伴。用中文自然地回答孩子当前真正问的事。
-首要目标是讲清楚：优先用直白的话说明实际原因和关系，保留必要条件，随语义理解追问、没听懂、例子、详细解释、故事及换话题。熟悉物品是可选参考，不要为使用它们硬套类比；不能用类比或拟人替代实际原因。
+首要目标是让孩子听懂、愿意继续问，不是考试或一次讲完教科书。用口语接住好奇心，直白说明当前问题的主要原因；合理的简化和形象说法可以使用，细节随追问展开。保留会改变结论的关键条件，不把“更容易”说成“一定”，也不把一种变化的原因套给另一种变化。熟悉物品是可选参考，不能为使用它们硬套类比或用拟人替代实际原因。
 不知道或没有看到实际物品就诚实说明；信息不足时问一个有用的澄清问题；前答有错就承认并纠正。
 注意条件范围：一种来源不存在不代表所有来源都不存在，一种常见情况不代表任何场景都如此。没有说明环境时，不假定位置、状态或全部条件，用自然的条件解释保留科学因果。
 先讲直接回答当前问题的核心关系和必要条件，周边细节留给追问，不为完整而一次讲完。没听懂或要求简单一点时，针对刚才关键的一处换说法，不只更换物品重复结果，也不连用多个比喻；卡点不明确时可以简短澄清。举例也只展开对当前问题有用的联系，省去想象场景的长铺垫。类比和故事只在有帮助或孩子需要时使用，区分想象和事实，不能用拟人动机替代原因。不能为了简短省略使结论成立的条件。
@@ -175,6 +175,24 @@ class ModelClient:
     def occupied(self):
         return self.ledger_occupied(self.ledger.read())
 
+    def check_budget(self, ledger, reserve, purpose="chat"):
+        available = self.limit() - self.config["budget"].get("manual_reserve_cny", 5)
+        if self.ledger_occupied(ledger) + reserve > available:
+            raise ProductError("已到本轮自动调用限额，保留了至少5元供人工试用。可以继续查看已有记录。", 402, "budget_exhausted")
+        if purpose in ("asr", "tts"):
+            used = math.fsum(float(x["occupiedCny"]) for x in ledger["calls"].values() if x.get("purpose") in ("asr", "tts"))
+            if used + reserve > self.config["speech"]["limit_cny"]:
+                raise ProductError("本轮云语音预算已到上限。可以继续文字提问或查看已保存的回答。", 402, "speech_budget")
+
+    def read_key(self):
+        try:
+            key = Path(self.config["key_file"]).read_text("utf-8").strip()
+        except OSError:
+            raise ProductError("本机密钥文件不可用，请家长在本地补充后重试。", 503, "key_unavailable")
+        if not key or len(key) > 256:
+            raise ProductError("本机密钥文件为空或格式异常。", 503, "key_unavailable")
+        return key
+
     @staticmethod
     def ledger_occupied(data):
         try:
@@ -203,12 +221,7 @@ class ModelClient:
                 point["properties"]["sourceMessageIds"]["items"]["enum"] = source_ids
         output_limit = min(c["max_completion_tokens"], task["tokens"]) if task else c["max_completion_tokens"]
         timeout = min(c["timeout_seconds"], task["timeout"]) if task else c["timeout_seconds"]
-        try:
-            key = Path(c["key_file"]).read_text("utf-8").strip()
-        except OSError:
-            raise ProductError("本机密钥文件不可用，请家长在本地补充后重试。", 503, "key_unavailable")
-        if not key or len(key) > 256:
-            raise ProductError("本机密钥文件为空或格式异常。", 503, "key_unavailable")
+        key = self.read_key()
         messages = [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
         prompt_bytes = len(json.dumps({"messages": messages, "schema": schema}, ensure_ascii=False).encode("utf-8"))
         if prompt_bytes > c["max_input_bytes"]:
@@ -217,12 +230,10 @@ class ModelClient:
         reserve = ((prompt_bytes + 512) * b["input_cny_per_million"] + (output_limit + 16) * b["output_cny_per_million"]) / 1_000_000
         call_id = identifier("call")
         with self.ledger.transaction() as ledger:
-            occupied = self.ledger_occupied(ledger)
-            if occupied + reserve > self.limit():
-                raise ProductError("本轮模型测试预算已到上限，请家长查看运行说明。", 402, "budget_exhausted")
+            self.check_budget(ledger, reserve)
             ledger["calls"][call_id] = {"requestId": request_id, "purpose": purpose, "model": c["model"], "startedAt": stamp(),
                 "status": "reserved", "occupiedCny": round(reserve, 6), "reservedCny": round(reserve, 6), "attempt": 1,
-                "inputBytes": prompt_bytes, "promptVersion": "demo-finish-v2", "enableThinking": c["enable_thinking"],
+                "inputBytes": prompt_bytes, "promptVersion": "investor-voice-v2", "enableThinking": c["enable_thinking"],
                 "outputLimit": output_limit, "timeoutSeconds": timeout}
         payload = {"model": c["model"], "messages": messages, "enable_thinking": c["enable_thinking"],
                    "preserve_thinking": False, "response_format": {"type": "json_schema", "json_schema": {"name": "curiosity_" + purpose, "strict": True, "schema": schema}},
@@ -297,6 +308,8 @@ class CompanionService:
         self.model = ModelClient(root)
         self.summary_slots = threading.BoundedSemaphore(2)
         self.closed = threading.Event()
+        from speech_support import SpeechService
+        self.speech = SpeechService(self)
         with self.store.transaction() as db:
             for name in ("profiles", "messages", "memoryItems", "conversations", "parentFeedback", "safetyEvents", "requests"):
                 db.setdefault(name, {})
@@ -501,6 +514,7 @@ class CompanionService:
 
     def close(self):
         self.closed.set()
+        self.speech.close()
         with self.store.transaction() as db:
             for conv in db["conversations"].values():
                 if conv.get("exploration", {}).get("status") == "pending":
@@ -557,8 +571,9 @@ class CompanionService:
             if previous:
                 db["messages"][message_id].update(status="pending", requestId=request_id)
             else:
+                input_source = self.speech.input_source(db, data, child_id, text)
                 db["messages"][message_id] = {"id": message_id, "childId": child_id, "conversationId": conv_id,
-                    "role": "user", "text": text, "style": style, "requestId": request_id, "status": "pending", "createdAt": stamp()}
+                    "role": "user", "text": text, "style": style, "requestId": request_id, "status": "pending", "createdAt": stamp(), "inputSource": input_source}
             request = {"id": request_id, "childId": child_id, "conversationId": conv_id, "text": text, "style": style,
                        "feedback": feedback, "feedbackFor": data.get("feedbackFor") if feedback else None,
                        "userMessageId": message_id, "status": "pending", "phase": "recall", "startedAt": stamp(), "attempt": (previous.get("attempt", 0) + 1) if previous else 1}
@@ -725,6 +740,8 @@ class CompanionService:
             if not item or item.get("childId") != data.get("childId") or item.get("type") != "dialogue_memory":
                 raise ProductError("没有找到本档案的这条记录。", 404)
             self.profile(db, item["childId"])
+            if data.get("expectedVersion") is not None and str(data["expectedVersion"]) != str(version(item)):
+                raise ProductError("这条记录已在别处更新。你的输入仍保留，请先查看最新记录，再合并修改。", 409, "memory_conflict")
             action = data.get("action", "edit")
             if action == "restore":
                 if any(db["messages"].get(x, {}).get("deleted") for x in item.get("sourceMessageIds", [])):
@@ -837,7 +854,11 @@ class CompanionService:
 
     def get(self, path, params):
         if path == "/api/status":
-            return self.model.public_status()
+            return {**self.model.public_status(), "speech": self.speech.public_status()}
+        if path == "/api/speech/request":
+            return self.speech.get(params.get("childId", [""])[0], params.get("requestId", [""])[0])
+        if path == "/api/speech/audio":
+            return self.speech.audio(params.get("childId", [""])[0], params.get("requestId", [""])[0])
         if path == "/api/profiles":
             db = self.store.read()
             return {"profiles": [self.public_profile(x) for x in db["profiles"].values() if not x.get("showcase")]}
@@ -852,6 +873,10 @@ class CompanionService:
         raise ProductError("没有这个接口。", 404)
 
     def mutate(self, path, data, method="POST"):
+        if path in ("/api/speech/transcribe", "/api/speech/synthesize"):
+            return self.speech.begin("asr" if path.endswith("transcribe") else "tts", data)
+        if path == "/api/speech/cancel":
+            return self.speech.cancel(data)
         if path == "/api/chat":
             return self.chat(data)
         if path == "/api/chat/cancel":
