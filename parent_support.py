@@ -316,6 +316,10 @@ class ParentService:
                     return {"memoryId": draft["savedMemoryId"], "status": "saved"}
                 if draft["status"] != "pending":
                     raise self.error("上次保存结果尚未确认，请先到记忆与提醒查看，避免重复添加。", 409)
+                if draft["action"] == "edit":
+                    target = db["memoryItems"].get(draft["memoryId"], {})
+                    if not active(target, child_id, target.get("conversationId")):
+                        raise self.error("这条记录已撤回或不可用，草稿未保存。请先在孩子档案中明确恢复记录。", 409, "parent_target_inactive")
                 if draft["action"] == "add" and not self.valid_result(db, m, child_id):
                     raise self.error("草稿依据已经变化，请重新整理提醒。", 409)
                 payload = {"childId": child_id, "summary": data.get("summary"), "topic": data.get("topic", draft.get("topic", "")),

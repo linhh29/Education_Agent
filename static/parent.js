@@ -58,7 +58,7 @@ async function parentAction(button){
  if(action==='parent-refresh-draft'){
   const form=button.closest('form'),draft=Object.fromEntries(new FormData(form));
   const latest=await api('/api/state?childId='+encodeURIComponent(id)),m=latest.memories.find(m=>m.id===form.dataset.memory);
-  if(!m||state.id!==id){toast('这条记录已不可用，请重新选择。');return;}
+  if(!m||['withdrawn','deleted'].includes(m.status)||state.id!==id){form.querySelector('.form-message').textContent='这条记录已撤回或不可用，草稿仍保留。请先在孩子档案中明确恢复记录。';return;}
   form.dataset.version=m.version;localStorage.setItem('parent-edit-'+id+'-'+form.dataset.message,JSON.stringify({...draft,expectedVersion:m.version}));
   form.querySelector('.form-message').textContent='当前记录：'+m.summary+'。你的草稿保留了，请对照后再保存。';
  }

@@ -121,6 +121,21 @@ class ParentTests(unittest.TestCase):
         self.s.parent.save_draft({**data, 'expectedVersion': 2})
         self.assertEqual(self.s.store.read()['memoryItems'][item['id']]['version'], 3)
 
+    def test_refreshed_edit_draft_cannot_revive_withdrawn_or_deleted_target(self):
+        for action in ('withdraw', 'delete'):
+            with self.subTest(action=action):
+                item = self.s.add_reminder({'childId': self.a, 'summary': '原提醒'})
+                draft = {'action': 'edit', 'memoryId': item['id'], 'summary': '拟修改', 'topic': '', 'scope': 'general'}
+                result, _ = self.ask(self.response(draft=draft), self.selector(memoryIds=[item['id']]))
+                changed = self.s.update_memory(item['id'], {'childId': self.a, 'action': action})
+                before = self.child_state()
+                data = {'childId': self.a, 'messageId': result['messages'][-1]['id'], 'summary': '拟修改', 'expectedVersion': changed['version']}
+                with self.assertRaises(ProductError) as caught:
+                    self.s.parent.save_draft(data)
+                self.assertEqual(caught.exception.code, 'parent_target_inactive')
+                self.assertEqual(self.child_state(), before)
+                self.assertEqual(self.s.parent.snapshot(self.a)['messages'][-1]['draft']['status'], 'pending')
+
     def test_activity_invalidation_tracks_actual_dependencies_only(self):
         used = self.s.add_reminder({'childId': self.a, 'summary': '轻物，桌边观察'})
         other = self.s.add_reminder({'childId': self.a, 'summary': '另一个无关提醒'})
