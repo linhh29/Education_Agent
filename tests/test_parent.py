@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import app
 from companion import CompanionService, ProductError, stamp
-from parent_support import ParentService
+from parent_support import ParentService, clean_advice
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,6 +38,9 @@ class ParentTests(unittest.TestCase):
 
     def selector(self, **extra):
         return {'mode': 'recent', 'fromDate': '', 'toDate': '', 'memoryIds': [], 'conversationIds': ['ca'], 'inheritActivity': False, **extra}
+
+    def edits(self, constraints, quote='最近怎么样'):
+        return [{'index': -1, 'text': text, 'quote': quote} for text in constraints]
 
     def ask(self, answer=None, selection=None, child=None, text='最近怎么样'):
         self.n += 1
@@ -149,7 +152,7 @@ class ParentTests(unittest.TestCase):
     def test_activity_survives_dialogue_tail_but_not_replacement_invalidation_or_clear(self):
         reminder = self.s.add_reminder({'childId': self.a, 'summary': '桌子中间，不用玻璃'})
         activity = {'title': '纸的形状', 'materials': '纸', 'steps': '在桌子中间折纸。', 'adultAction': '家长折，孩子观察。', 'why': '看形状', 'constraints': ['不用玻璃', '桌子中间', '家长操作']}
-        self.ask(self.response(activity=activity, sources=[reminder['id']]), self.selector(memoryIds=[reminder['id']], activityIntent='new'))
+        self.ask(self.response(activity=activity, sources=[reminder['id']]), self.selector(memoryIds=[reminder['id']], activityIntent='new', constraintEdits=self.edits(activity['constraints'])))
         for _ in range(4):
             snapshot, _ = self.ask(self.response(activity={**activity, 'title': '无关回答误带的活动'}), self.selector(activityIntent='none'))
             self.assertIsNone(snapshot['messages'][-1]['activity'])
@@ -162,7 +165,7 @@ class ParentTests(unittest.TestCase):
         _, contexts = self.ask(self.response(sources=[]), self.selector(activityIntent='continue'))
         self.assertIsNone(contexts[-1][1]['previousActivity'])
         replacement = {**activity, 'title': '新的活动', 'constraints': ['地面观察']}
-        _, contexts = self.ask(self.response(activity=replacement), self.selector(activityIntent='new'))
+        _, contexts = self.ask(self.response(activity=replacement), self.selector(activityIntent='new', constraintEdits=self.edits(replacement['constraints'])))
         self.assertIsNone(contexts[-1][1]['previousActivity'])
         self.assertEqual(self.s.parent.snapshot(self.a)['activity']['constraints'], ['地面观察'])
         self.ask(self.response(answer='好，结束这项活动。'), self.selector(activityIntent='clear'))
@@ -175,7 +178,7 @@ class ParentTests(unittest.TestCase):
                     'adultAction': '家长陪同折纸。', 'why': '观察折叠前后的形状。',
                     'constraints': ['桌面观察', '不用工具']}
         self.ask(self.response(activity=activity, sources=[reminder['id']]),
-                 self.selector(memoryIds=[reminder['id']], activityIntent='new'))
+                 self.selector(memoryIds=[reminder['id']], activityIntent='new', constraintEdits=self.edits(activity['constraints'])))
         before = self.child_state()
         accidental_rewrite = {**activity, 'materials': '其他材料', 'steps': '换了一个观察。'}
         paused, contexts = self.ask(
@@ -213,10 +216,10 @@ class ParentTests(unittest.TestCase):
                    'adultAction': '家长放好积木。', 'why': '观察不同形状。', 'constraints': ['不用纸']}
         for intent in ('continue', 'new'):
             with self.subTest(intent=intent):
-                self.ask(self.response(activity=original), self.selector(activityIntent='new'))
+                self.ask(self.response(activity=original), self.selector(activityIntent='new', constraintEdits=self.edits(original['constraints'])))
                 self.ask(self.response(answer='可以以后再做。'), self.selector(activityIntent='retain'))
                 result, contexts = self.ask(self.response(activity=changed),
-                    self.selector(activityIntent=intent), text='以后也不用纸，换成积木来观察。')
+                    self.selector(activityIntent=intent, constraintEdits=[{'index': 0 if intent == 'continue' else -1, 'text': '不用纸', 'quote': '以后也不用纸'}]), text='以后也不用纸，换成积木来观察。')
                 self.assertEqual({k: result['activity'][k] for k in changed}, changed)
                 self.assertEqual(contexts[-1][1]['previousActivity'], original if intent == 'continue' else None)
 
@@ -361,6 +364,93 @@ class ParentTests(unittest.TestCase):
         self.s.update_memory(used['id'], {'childId': self.a, 'action': 'withdraw'})
         self.assertIsNone(self.s.parent.snapshot(self.a)['activity'])
         self.assertTrue(self.s.parent.snapshot(self.a)['messages'][-1]['stale'])
+
+
+    def test_activity_contract_survives_material_and_timing_changes_then_explicit_step_change(self):
+        initial = {'title': '观察纸的形状', 'materials': '纸', 'steps': ['平放纸。', '折起纸再观察。'],
+                   'adultAction': '家长折纸，孩子看。', 'why': '比较形状。', 'constraints': ['模型误加的限制']}
+        initial_text = '请用纸，在桌面由家长操作，不用工具，分为两个环节。'
+        required = ['用纸', '在桌面', '由家长操作', '不用工具']
+        first, _ = self.ask(self.response(activity=copy.deepcopy(initial)),
+            self.selector(activityIntent='new', constraintEdits=self.edits(required, initial_text),
+                          stepCount=2, stepCountQuote='分为两个环节'), text=initial_text)
+        self.assertEqual(first['lastRequest']['status'], 'completed')
+        self.assertEqual(first['activity']['constraints'], required)
+        self.assertEqual(first['activity']['stepCount'], 2)
+        changed, contexts = self.ask(self.response(activity={**initial, 'materials': '毛巾',
+            'steps': ['平放毛巾。', '家长折起毛巾再观察。']}),
+            self.selector(activityIntent='continue', constraintEdits=[{'index': 0, 'text': '用毛巾', 'quote': '换成毛巾'}]),
+            text='材料换成毛巾，其他安排不变。')
+        self.assertEqual(changed['lastRequest']['status'], 'completed')
+        self.assertEqual(contexts[-1][1]['activityRequirements'], {'constraints': ['用毛巾'] + required[1:], 'stepCount': 2})
+        self.assertEqual(changed['activity']['stepCount'], 2)
+        self.assertEqual(changed['activity']['constraints'], ['用毛巾'] + required[1:])
+        canonical = copy.deepcopy(changed['activity'])
+        later, _ = self.ask(self.response(answer='周末再做，方案保留。'), self.selector(activityIntent='retain'), text='改到周末。')
+        self.assertEqual(later['activity'], canonical)
+        third, contexts = self.ask(self.response(activity={**initial, 'materials': '毛巾',
+            'steps': ['平放毛巾。', '家长折起毛巾。', '比较形状。']}),
+            self.selector(activityIntent='continue', constraintEdits=[], stepCount=3, stepCountQuote='分成三个环节'),
+            text='现在分成三个环节，其他条件保持。')
+        self.assertEqual(third['lastRequest']['status'], 'completed')
+        self.assertEqual(third['activity']['stepCount'], 3)
+        self.assertEqual(third['activity']['constraints'], ['用毛巾'] + required[1:])
+        self.assertEqual(contexts[-1][1]['activityRequirements']['stepCount'], 3)
+        # A later generation cannot silently replace the confirmed plan with four steps.
+        bad, contexts = self.ask(self.response(activity={**initial, 'steps': ['一', '二', '三', '四']}),
+                                self.selector(activityIntent='continue'), text='换一个观察角度。')
+        self.assertEqual(bad['lastRequest']['status'], 'failed')
+        self.assertEqual(bad['activity'], third['activity'])
+        self.assertEqual([purpose for purpose, _ in contexts], ['parent_select', 'parent_answer'])
+
+    def test_activity_edits_need_current_parent_quote_and_do_not_inherit_for_new_plan(self):
+        prior = {'constraints': ['只用纸', '家长操作'], 'stepCount': 2}
+        for selected in [
+            {'constraintEdits': [{'index': 0, 'text': '使用剪刀', 'quote': '不存在的原话'}]},
+            {'stepCount': 3, 'stepCountQuote': '不存在的原话'},
+            {'constraintEdits': [{'index': 10, 'text': '', 'quote': '换一个'}]},
+        ]:
+            with self.assertRaises(ProductError):
+                self.s.parent.activity_requirements(selected, prior, 'continue', '换一个')
+        fresh = self.s.parent.activity_requirements({}, prior, 'new', '换一个活动')
+        self.assertEqual(fresh, {'constraints': [], 'stepCount': None})
+        cleared = self.s.parent.activity_requirements({'stepCount': 0, 'stepCountQuote': '不限制步数'}, prior, 'continue', '不限制步数')
+        self.assertEqual(cleared, {'constraints': prior['constraints'], 'stepCount': None})
+
+    def test_advice_projection_removes_serialized_structure_and_keeps_short_prose(self):
+        fragments = [None, {}, [], ':null', ': null', 'activityIntent:', 'sources: []',
+                     'usedEvidenceIds: ["x"]', '{"activityIntent":"continue"}',
+                     '```json\n{"advice":null}\n```', 'someUnusedField:', 'undefined']
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                self.assertEqual(clean_advice(fragment), '')
+        for text in ['看看。', '好。', '1分钟', '👀', 'Look closely.', 'Tip: watch the shape.']:
+            self.assertEqual(clean_advice(text), text)
+        self.assertEqual(clean_advice('{"advice":"看看。","sources":[]}'), '看看。')
+        self.assertEqual(clean_advice('看看。\nactivityIntent: continue'), '看看。')
+        result, _ = self.ask(self.response(advice=': null'))
+        mid = result['messages'][-1]['id']
+        self.assertEqual(self.s.store.read()['parentMessages'][mid]['advice'], '')
+        with self.s.store.transaction() as db:
+            db['parentMessages'][mid]['advice'] = 'activityIntent:'
+        with patch.object(self.s.model, 'complete', side_effect=AssertionError('read called model')):
+            self.assertEqual(self.s.parent.snapshot(self.a)['messages'][-1]['advice'], '')
+        self.assertEqual(self.s.store.read()['parentMessages'][mid]['advice'], 'activityIntent:')
+
+    def test_invalid_draft_sources_leave_child_unchanged_and_explicit_retry_can_succeed(self):
+        before = self.child_state()
+        draft = {'action': 'add', 'memoryId': '', 'summary': '请简短说明', 'topic': '', 'scope': 'general'}
+        failed, contexts = self.ask(self.response(sources=['not_supplied'], draft=draft), text='请把讲解简短一些，整理成提醒。')
+        self.assertEqual(failed['lastRequest']['status'], 'failed')
+        self.assertEqual(failed['lastRequest']['error'], '这次回答的依据未能核对，请重试。')
+        self.assertEqual(self.child_state(), before)
+        self.assertEqual([purpose for purpose, _ in contexts], ['parent_select', 'parent_answer'])
+        retried, _ = self.ask(self.response(sources=['uca'], draft=draft), text='请把讲解简短一些，整理成提醒。')
+        self.assertEqual(retried['lastRequest']['status'], 'completed')
+        self.assertEqual(self.child_state(), before)
+        saved = self.s.parent.save_draft({'childId': self.a, 'messageId': retried['messages'][-1]['id'],
+            'summary': draft['summary'], 'scope': 'general', 'topic': ''})
+        self.assertEqual(self.s.store.read()['memoryItems'][saved['memoryId']]['summary'], draft['summary'])
 
     def test_network_does_not_hold_store_lock_and_cancellation_discards_late_result(self):
         entered, release = threading.Event(), threading.Event()

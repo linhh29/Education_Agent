@@ -3911,8 +3911,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
             return self.product_api(parsed)
-        if parsed.path == "/video-demo":
-            return self.serve_file(STATIC_DIR / "video-demo.html", "text/html; charset=utf-8")
         if parsed.path in ("/", "/setup", "/child", "/parent", "/memory"):
             return self.serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if parsed.path.startswith("/static/"):
@@ -4333,7 +4331,7 @@ PRODUCT = None
 
 def main() -> None:
     global PRODUCT
-    port = int(os.environ.get("PORT", "8788"))
+    port = int(os.environ.get("PORT", "8000"))
     host = os.environ.get("HOST", "127.0.0.1")
     if host != "127.0.0.1":
         raise ValueError("本轮本机演示只绑定 127.0.0.1")

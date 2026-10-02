@@ -19,8 +19,42 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 
 def clean_advice(value):
-    """Hide empty/punctuation-only advice, including already saved replies."""
-    text = str(value or "").strip()[:2000]
+    """Project user prose, not serialized fields; never rewrite saved history."""
+    from parent_prompts import PARENT_TASKS
+    if not isinstance(value, str):
+        return ""
+    try:
+        decoded = json.loads(value)
+    except (ValueError, TypeError):
+        decoded = value
+    if isinstance(decoded, dict):
+        return clean_advice(decoded.get("advice"))
+    if not isinstance(decoded, str):
+        return ""
+    def fields(schema):
+        if isinstance(schema, dict):
+            return set(schema.get("properties", {})) | set().union(*(fields(v) for v in schema.values()))
+        if isinstance(schema, list):
+            return set().union(*(fields(v) for v in schema))
+        return set()
+    internal = set().union(*(fields(t["schema"]) for t in PARENT_TASKS.values()))
+    lines = []
+    for line in value.strip()[:2000].splitlines():
+        line = line.strip()
+        if line.startswith("```"):
+            continue
+        field = re.fullmatch(r'[\s{,]*[\"\']?([A-Za-z_][\w]*)[\"\']?\s*:\s*(.*)', line)
+        if field:
+            key, content = field.groups()
+            if key == "advice":
+                line = content.strip(' \"\',}')
+            elif key in internal or not content.strip():
+                continue
+        # Empty JSON values are absence, including fragments such as ':null'.
+        if re.fullmatch(r'[\s:;,\[\]{}\"\'`]*(?:(?i:null|none|undefined|true|false))?[\s:;,\[\]{}\"\'`]*', line):
+            continue
+        lines.append(line)
+    text = "\n".join(lines).strip()
     return text if any(unicodedata.category(char)[0] in "LNS" for char in text) else ""
 
 
@@ -202,6 +236,39 @@ class ParentService:
         except (ValueError, TypeError):
             return False
 
+    def activity_requirements(self, selected, previous, intent, question):
+        """Apply explicit semantic edits; omitted requirements remain authoritative."""
+        previous = previous or {}
+        constraints = list(previous.get("constraints", [])) if intent == "continue" else []
+        count = previous.get("stepCount") if intent == "continue" else None
+        edits = selected.get("constraintEdits", [])
+        replacements, additions = {}, []
+        if not isinstance(edits, list):
+            raise self.error("活动要求尚未整理完整，请重新说明要改哪一项。", 502, "parent_activity_contract")
+        for edit in edits:
+            index, text, quote = edit.get("index"), edit.get("text"), edit.get("quote")
+            if (type(index) is not int or index < -1 or index >= len(constraints)
+                    or not isinstance(text, str) or len(text) > 300
+                    or not isinstance(quote, str) or not quote.strip() or quote not in question
+                    or index >= 0 and index in replacements):
+                raise self.error("未能核对这次活动要求的变更，原方案保留。", 502, "parent_activity_contract")
+            if index == -1:
+                if text.strip():
+                    additions.append(text.strip())
+            else:
+                replacements[index] = text.strip()
+        constraints = [replacements.get(i, text) for i, text in enumerate(constraints)] + additions
+        constraints = list(dict.fromkeys(text for text in constraints if text))
+        if len(constraints) > 24:
+            raise self.error("活动要求较多，请先简化安排；原方案保留。", 400, "parent_activity_contract")
+        new_count = selected.get("stepCount")
+        if new_count is not None:
+            quote = selected.get("stepCountQuote", "")
+            if type(new_count) is not int or not 0 <= new_count <= 12 or not quote or quote not in question:
+                raise self.error("未能核对步骤数量的变更，原方案保留。", 502, "parent_activity_contract")
+            count = new_count or None
+        return {"constraints": constraints, "stepCount": count}
+
     def context(self, request):
         child_id = request["childId"]
         db = self.store.read()
@@ -306,6 +373,8 @@ class ParentService:
                    # content; older AI paraphrases must not become new constraints.
                    "parentHistory": parent_history(600, parent_only=activity_intent == "retain"),
                    "previousActivity": previous_activity}
+        if activity_intent in ("new", "continue"):
+            context["activityRequirements"] = self.activity_requirements(selected, previous_activity, activity_intent, request["text"])
         if len(json.dumps(context, ensure_ascii=False).encode()) > 28000:
             raise self.error("相关记录较多，请缩小到一个话题或时间段再问。", 400, "parent_capacity")
         inherited = ({"memoryVersions": previous.get("memoryVersions", []), "sourceMessageIds": previous.get("sourceMessageIds", [])}
@@ -338,6 +407,20 @@ class ParentService:
             # replace the plan even if the answer model returns another card.
             activity = result.get("activity") if context["activityIntent"] in ("new", "continue") else None
             if activity:
+                requirements = context["activityRequirements"]
+                steps = activity.get("steps")
+                if isinstance(steps, list):
+                    if (not 1 <= len(steps) <= 12 or any(not isinstance(s, str) or not s.strip() for s in steps)
+                            or requirements["stepCount"] is not None and len(steps) != requirements["stepCount"]):
+                        raise self.error("活动步骤未符合已确认的安排，原方案保留，请重试。", 502, "parent_activity_contract")
+                    activity["steps"] = "\n".join(f"{i+1}. {s.strip()}" for i, s in enumerate(steps))
+                elif requirements["stepCount"] is not None:
+                    raise self.error("活动步骤未完整整理，原方案保留，请重试。", 502, "parent_activity_contract")
+                activity["constraints"] = requirements["constraints"]
+                if requirements["stepCount"] is not None:
+                    activity["stepCount"] = requirements["stepCount"]
+                else:
+                    activity.pop("stepCount", None)
                 if not all(isinstance(activity.get(k), str) and activity[k].strip() for k in ("title", "materials", "steps", "adultAction", "why")):
                     raise self.error("活动步骤尚不完整，可以重新问一个更简单的活动。", 502)
                 check = safe_suggestion({"title": activity["title"], "steps": "\n".join(activity[k] for k in ("materials", "steps", "adultAction")), "why": activity["why"]})

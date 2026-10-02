@@ -20,3 +20,11 @@ docs/screenshots/
 data/*-speech-cache/
 data/synthetic-audio/
 docs/demo-recordings/
+
+# Runtime and private artifacts are never release inputs.
+data/
+logs/
+*.wav
+*.mp3
+*.m4a
+*.webm
