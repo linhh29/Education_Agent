@@ -114,18 +114,19 @@ class ParentService:
         from companion import identifier, stamp
         child_id, rid = str(data.get("childId", "")), str(data.get("requestId", ""))
         text = str(data.get("text", "")).strip()
+        record_id = str(data.get("recordId") or "")
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", rid) or not text or len(text) > 1000:
             raise self.error("请填写1000字以内的家长问题。")
         with self.store.transaction() as db:
             self.service.profile(db, child_id)
             old = db["parentRequests"].get(rid)
             if old:
-                if old["childId"] != child_id or old["text"] != text:
-                    raise self.error("这次请求与原问题不一致。", 409)
+                if (old["childId"] != child_id or old["text"] != text
+                        or str(old.get("recordId") or "") != record_id):
+                    raise self.error("这次请求的问题或目标记录与原请求不一致，请重新发送。", 409, "parent_request_conflict")
                 return copy.deepcopy(old)
             if any(r["childId"] == child_id and r["status"] == "pending" for r in db["parentRequests"].values()):
                 raise self.error("这个档案还有一个家长问题正在回答，请稍候或停止。", 409)
-            record_id = str(data.get("recordId") or "")
             if record_id and not self.source(db, record_id, child_id):
                 raise self.error("这条依据不可用，请从当前档案重新选择。", 404)
             mid = identifier("parent")
@@ -405,6 +406,20 @@ class ParentService:
                 payload = {"childId": child_id, "summary": data.get("summary"), "topic": data.get("topic", draft.get("topic", "")),
                            "scope": data.get("scope", draft.get("scope")), "action": "edit",
                            "expectedVersion": data.get("expectedVersion", draft.get("expectedVersion"))}
+                # A scoped draft has no implicit "latest conversation". The
+                # parent confirms a concrete owned conversation in the form.
+                if payload["scope"] == "conversation" and (draft["action"] == "add" or target.get("kind") == "reminder"):
+                    conversation_id = str(data.get("conversationId", draft.get("conversationId", "")) or "")
+                    if "conversationId" not in data and "conversationId" not in draft and draft["action"] == "edit":
+                        conversation_id = target.get("conversationId", "")
+                    conversation = db["conversations"].get(conversation_id, {})
+                    if not conversation_id:
+                        raise self.error("请选择这条提醒适用的聊天；未选择时不会保存或扩大范围。", 400, "reminder_conversation")
+                    if conversation.get("childId") != child_id or conversation.get("deleted"):
+                        raise self.error("所选聊天不属于当前档案或已被删除，请重新选择。", 409, "reminder_conversation")
+                    payload["conversationId"] = conversation_id
+                else:
+                    payload["conversationId"] = ""
                 saved_draft = copy.deepcopy(draft)
                 draft["status"] = "saving"
             try:
@@ -417,5 +432,7 @@ class ParentService:
                     db["parentMessages"][mid]["draft"]["status"] = "pending"
                 raise
             with self.store.transaction() as db:
-                db["parentMessages"][mid]["draft"].update(status="saved", savedMemoryId=item["id"], savedAt=stamp(), summary=item["summary"])
+                db["parentMessages"][mid]["draft"].update(status="saved", savedMemoryId=item["id"], savedAt=stamp(),
+                    summary=item["summary"], topic=item.get("topic", ""), scope=item.get("scope"),
+                    conversationId=item.get("conversationId", ""))
             return {"memoryId": item["id"], "status": "saved"}

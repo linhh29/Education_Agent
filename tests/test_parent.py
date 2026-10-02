@@ -202,6 +202,73 @@ class ParentTests(unittest.TestCase):
         with self.assertRaises(ProductError):
             self.s.parent.save_draft({**data, 'childId': self.b})
 
+    def test_request_retry_identity_includes_child_text_and_target_record(self):
+        first = self.s.add_reminder({'childId': self.a, 'summary': '记录A'})
+        second = self.s.add_reminder({'childId': self.a, 'summary': '记录B'})
+        data = {'childId': self.a, 'requestId': 'parent_identity_001', 'text': '这条记录的依据', 'recordId': first['id']}
+        with patch('parent_support.threading.Thread') as worker:
+            original = self.s.parent.begin(data)
+            self.assertEqual(self.s.parent.begin(data), original)
+            for changed in ({'recordId': second['id']}, {'recordId': ''}, {'text': '另一个问题'}, {'childId': self.b}):
+                with self.subTest(changed=changed), self.assertRaises(ProductError) as caught:
+                    self.s.parent.begin({**data, **changed})
+                self.assertEqual((caught.exception.status, caught.exception.code), (409, 'parent_request_conflict'))
+            self.assertEqual(worker.call_count, 1)
+            with self.s.store.transaction() as db:
+                db['parentRequests'][data['requestId']]['status'] = 'completed'
+            before = self.s.store.read()
+            self.assertEqual(self.s.parent.begin(data)['status'], 'completed')
+            self.assertEqual(self.s.store.read(), before)
+            next_request = self.s.parent.begin({**data, 'requestId': 'parent_identity_002', 'recordId': second['id']})
+            self.assertEqual(next_request['recordId'], second['id'])
+            self.assertEqual(worker.call_count, 2)
+
+    def test_conversation_draft_needs_explicit_owned_conversation_and_keeps_scope(self):
+        draft = {'action': 'add', 'memoryId': '', 'summary': '只在这段聊天里举例', 'topic': '', 'scope': 'conversation'}
+        result, _ = self.ask(self.response(draft=draft))
+        mid = result['messages'][-1]['id']
+        data = {'childId': self.a, 'messageId': mid, 'summary': draft['summary']}
+        before = self.child_state()
+        for conversation_id in (None, '', 'cb', 'missing'):
+            with self.subTest(conversation_id=conversation_id), self.assertRaises(ProductError):
+                self.s.parent.save_draft({**data, **({'conversationId': conversation_id} if conversation_id is not None else {})})
+            self.assertEqual(self.child_state(), before)
+            self.assertEqual(self.s.parent.snapshot(self.a)['messages'][-1]['draft']['status'], 'pending')
+        with self.s.store.transaction() as db:
+            db['conversations']['removed'] = {**db['conversations']['ca'], 'id': 'removed', 'deleted': True}
+        with self.assertRaises(ProductError):
+            self.s.parent.save_draft({**data, 'conversationId': 'removed'})
+        saved = self.s.parent.save_draft({**data, 'conversationId': 'ca'})
+        db = self.s.store.read()
+        item = db['memoryItems'][saved['memoryId']]
+        self.assertEqual((item['scope'], item['conversationId']), ('conversation', 'ca'))
+        self.assertEqual(db['parentMessages'][mid]['draft']['scope'], 'conversation')
+        self.assertEqual(db['parentMessages'][mid]['draft']['conversationId'], 'ca')
+        self.assertIn(item['id'], [m['id'] for m in self.s.candidates(db, self.a, '举例', 'ca')])
+        self.assertNotIn(item['id'], [m['id'] for m in self.s.candidates(db, self.a, '举例', 'new_conversation')])
+        self.assertEqual(self.s.parent.save_draft({**data, 'conversationId': 'ca'}), saved)
+        self.assertEqual(self.s.store.read(), db)
+
+    def test_parent_draft_preserves_confirmed_topic_and_general_scope(self):
+        for scope, topic in [('topic', '滚动'), ('general', ''), ('general', '只是标签')]:
+            with self.subTest(scope=scope, topic=topic):
+                draft = {'action': 'add', 'memoryId': '', 'summary': '家长确认的讲法', 'topic': topic, 'scope': scope}
+                result, _ = self.ask(self.response(draft=draft))
+                saved = self.s.parent.save_draft({'childId': self.a, 'messageId': result['messages'][-1]['id'], 'summary': draft['summary']})
+                item = self.s.store.read()['memoryItems'][saved['memoryId']]
+                self.assertEqual((item['scope'], item['topic']), (scope, topic))
+
+    def test_editing_conversation_reminder_does_not_expand_or_rebind_it(self):
+        item = self.s.add_reminder({'childId': self.a, 'summary': '原提醒', 'scope': 'conversation', 'conversationId': 'ca'})
+        draft = {'action': 'edit', 'memoryId': item['id'], 'summary': '修改后的提醒', 'topic': '', 'scope': 'conversation'}
+        result, _ = self.ask(self.response(draft=draft), self.selector(memoryIds=[item['id']]))
+        data = {'childId': self.a, 'messageId': result['messages'][-1]['id'], 'summary': draft['summary']}
+        with self.assertRaises(ProductError):
+            self.s.parent.save_draft({**data, 'conversationId': ''})
+        saved = self.s.parent.save_draft(data)
+        item = self.s.store.read()['memoryItems'][saved['memoryId']]
+        self.assertEqual((item['scope'], item['conversationId']), ('conversation', 'ca'))
+
     def test_edit_conflict_keeps_draft_and_reuses_existing_version_mechanism(self):
         item = self.s.add_reminder({'childId': self.a, 'summary': '原提醒'})
         draft = {'action': 'edit', 'memoryId': item['id'], 'summary': '拟修改', 'topic': '', 'scope': 'general'}

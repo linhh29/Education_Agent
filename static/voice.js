@@ -8,6 +8,7 @@ class CuriosityVoice {
  inputBusy(){return ['permission','recording','converting','recognizing'].includes(this.phase);}
  update(phase,error=''){this.phase=phase;this.error=error;this.changed();}
  valid(epoch,ctx){return this.epoch===epoch&&this.context().childId===ctx.childId;}
+ validJob(epoch,ctx,id){return this.valid(epoch,ctx)&&this.job?.id===id;}
  taskKey(){return 'curiosity-voice-task-'+this.context().childId;}
  stop(cancelPending=true){
   ++this.epoch;clearInterval(this.ticker);clearTimeout(this.deadline);
@@ -34,14 +35,15 @@ class CuriosityVoice {
    recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};
    recorder.onerror=()=>{if(this.valid(epoch,ctx)){this.stop();this.update('asr_error','录音中断了，请重新录音或打字。');}};
    recorder.onstop=async()=>{
-    clearInterval(this.ticker);clearTimeout(this.deadline);stream.getTracks().forEach(t=>t.stop());
-    if(!this.valid(epoch,ctx))return;
+    stream.getTracks().forEach(t=>t.stop());
+    if(!this.valid(epoch,ctx)||this.recorder!==recorder)return;
+    clearInterval(this.ticker);clearTimeout(this.deadline);
     this.stream=null;this.recorder=null;
     await this.convertAndRecognize(new Blob(chunks,{type:recorder.mimeType}),epoch,ctx,'microphone');
    };
    recorder.start();this.started=performance.now();this.event('recording_started');this.update('recording');
-   this.ticker=setInterval(()=>this.changed(),500);
-   this.deadline=setTimeout(()=>{if(recorder.state==='recording')recorder.stop();},ctx.maxSeconds*1000);
+   this.ticker=setInterval(()=>{if(this.valid(epoch,ctx)&&this.recorder===recorder)this.changed();},500);
+   this.deadline=setTimeout(()=>{if(this.valid(epoch,ctx)&&this.recorder===recorder&&recorder.state==='recording')recorder.stop();},ctx.maxSeconds*1000);
   }catch(err){
    if(!this.valid(epoch,ctx))return;
    this.stream?.getTracks().forEach(t=>t.stop());this.stream=null;
@@ -64,6 +66,7 @@ class CuriosityVoice {
   return new Uint8Array(result);
  }
  async convertAndRecognize(blob,epoch,ctx,inputKind){
+  if(!this.valid(epoch,ctx))return;
   this.update('converting');let decoder;
   try{
    if(!blob.size)throw new Error('没有录到声音，请重录或打字。');
@@ -82,24 +85,28 @@ class CuriosityVoice {
   finally{await decoder?.close().catch(()=>{});}
  }
  async recognize(epoch=this.epoch,ctx=this.context()){
-  if(!this.raw||this.phase==='recognizing')return;
+  if(!this.valid(epoch,ctx)||!this.raw||this.phase==='recognizing')return;
   this.update('recognizing');const id='speech_'+crypto.randomUUID().replaceAll('-','');
   this.job={id,childId:ctx.childId,kind:'asr',status:'pending'};localStorage.setItem(this.taskKey(),JSON.stringify(this.job));
   let binary='';for(let i=0;i<this.raw.length;i+=8192)binary+=String.fromCharCode(...this.raw.subarray(i,i+8192));
   try{
    const job=await this.api('/api/speech/transcribe',{requestId:id,childId:ctx.childId,conversationId:ctx.conversationId,audio:btoa(binary),inputKind:this.inputKind});
-   if(!this.valid(epoch,ctx))return;
+   if(!this.validJob(epoch,ctx,id))return;
    await this.poll(job,epoch,ctx);
-  }catch(err){if(this.valid(epoch,ctx)){this.unknown=!err.status;if(!this.unknown){localStorage.removeItem(this.taskKey());this.job=null;if(['audio_empty','audio_length','audio_format'].includes(err.code))this.raw=null;}this.update('asr_error',(err.name==='AbortError'?'识别请求的完成状态暂时不明确。':err.message)+(this.unknown?' 还没有发送问题，可以先查看识别状态。':''));}}
+  }catch(err){if(this.validJob(epoch,ctx,id)){this.unknown=!err.status;if(!this.unknown){localStorage.removeItem(this.taskKey());this.job=null;if(['audio_empty','audio_length','audio_format'].includes(err.code))this.raw=null;}this.update('asr_error',(err.name==='AbortError'?'识别请求的完成状态暂时不明确。':err.message)+(this.unknown?' 还没有发送问题，可以先查看识别状态。':''));}}
  }
  async poll(job,epoch,ctx){
+  if(!this.valid(epoch,ctx)||(this.job&&this.job.id!==job.id))return;
+  const id=job.id;
   this.job=job;
-  while(job.status==='pending'&&this.valid(epoch,ctx)){
+  while(job.status==='pending'&&this.validJob(epoch,ctx,id)){
    await new Promise(resolve=>setTimeout(resolve,450));
-   if(!this.valid(epoch,ctx))return;
-   job=await this.api('/api/speech/request?'+new URLSearchParams({childId:ctx.childId,requestId:job.id}));this.job=job;
+   if(!this.validJob(epoch,ctx,id))return;
+   const result=await this.api('/api/speech/request?'+new URLSearchParams({childId:ctx.childId,requestId:id}));
+   if(!this.validJob(epoch,ctx,id))return;
+   this.job=job=result;
   }
-  if(!this.valid(epoch,ctx))return;
+  if(!this.validJob(epoch,ctx,id))return;
   this.unknown=false;
   if(job.kind==='asr'){
    localStorage.removeItem(this.taskKey());
@@ -117,14 +124,17 @@ class CuriosityVoice {
  async recover(){
   if(this.phase==='recognizing'||this.phase==='tts_loading')return;
   const job=this.job||JSON.parse(localStorage.getItem(this.taskKey())||'null');if(!job)return;
-  const epoch=this.epoch,ctx=this.context();this.update(job.kind==='asr'?'recognizing':'tts_loading');
-  try{await this.poll(await this.api('/api/speech/request?'+new URLSearchParams({childId:ctx.childId,requestId:job.id})),epoch,ctx);}
-  catch(err){if(this.valid(epoch,ctx)){this.unknown=!err.status;if(!this.unknown){if(job.kind==='asr')localStorage.removeItem(this.taskKey());this.job=null;}this.update(job.kind==='asr'?'asr_error':'tts_error',err.name==='AbortError'?'暂时没有查到完成状态，可以稍后再查看。':err.message);}}
+  const ctx=this.context();if(job.childId&&job.childId!==ctx.childId)return;
+  const epoch=++this.epoch;this.job={...job,childId:ctx.childId};this.update(job.kind==='asr'?'recognizing':'tts_loading');
+  try{const result=await this.api('/api/speech/request?'+new URLSearchParams({childId:ctx.childId,requestId:job.id}));if(this.validJob(epoch,ctx,job.id))await this.poll(result,epoch,ctx);}
+  catch(err){if(this.validJob(epoch,ctx,job.id)){this.unknown=!err.status;if(!this.unknown){if(job.kind==='asr')localStorage.removeItem(this.taskKey());this.job=null;}this.update(job.kind==='asr'?'asr_error':'tts_error',err.name==='AbortError'?'暂时没有查到完成状态，可以稍后再查看。':err.message);}}
  }
  async playAudio(epoch,ctx){
+  if(!this.valid(epoch,ctx)||!this.audio)return;
+  const audio=this.audio;
   this.update('play_ready');
-  try{await this.audio.play();}
-  catch(err){if(this.valid(epoch,ctx))this.update('play_ready',err.name==='NotAllowedError'?'浏览器需要你再点一次播放。':'播放没有开始，可以再次点击或继续阅读。');}
+  try{await audio.play();}
+  catch(err){if(this.valid(epoch,ctx)&&this.audio===audio)this.update('play_ready',err.name==='NotAllowedError'?'浏览器需要你再点一次播放。':'播放没有开始，可以再次点击或继续阅读。');}
  }
  async speak(messageId){
   if(this.inputBusy())return;
@@ -133,8 +143,8 @@ class CuriosityVoice {
   if(this.messageId===messageId&&this.phase==='tts_loading')return;
   this.stop();const epoch=this.epoch,ctx=this.context();this.messageId=messageId;this.update('tts_loading');
   const id='speech_'+crypto.randomUUID().replaceAll('-','');this.job={id,childId:ctx.childId,kind:'tts',status:'pending'};
-  try{const job=await this.api('/api/speech/synthesize',{childId:ctx.childId,requestId:id,messageId});if(this.valid(epoch,ctx))await this.poll(job,epoch,ctx);}
-  catch(err){if(this.valid(epoch,ctx)){this.unknown=!err.status;if(!this.unknown)this.job=null;this.update('tts_error',(err.name==='AbortError'?'朗读请求的完成状态暂时不明确。':err.message)+' 文字回答没有丢失。');}}
+  try{const job=await this.api('/api/speech/synthesize',{childId:ctx.childId,requestId:id,messageId});if(this.validJob(epoch,ctx,id))await this.poll(job,epoch,ctx);}
+  catch(err){if(this.validJob(epoch,ctx,id)){this.unknown=!err.status;if(!this.unknown)this.job=null;this.update('tts_error',(err.name==='AbortError'?'朗读请求的完成状态暂时不明确。':err.message)+' 文字回答没有丢失。');}}
  }
 }
 if(typeof module!=='undefined')module.exports=CuriosityVoice;

@@ -144,7 +144,9 @@ class DialogueTests(unittest.TestCase):
 
     def test_edit_withdraw_delete_restore_are_consistent(self):
         item = self.service.add_reminder({'childId':self.child,'summary':'原提醒','topic':'话题甲'})
-        def update(action,**fields):return self.service.update_memory(item['id'],{'childId':self.child,'action':action,**fields})
+        def update(action,**fields):
+            current = self.service.store.read()['memoryItems'][item['id']]
+            return self.service.update_memory(item['id'],{'childId':self.child,'action':action,'expectedVersion':current['version'],**fields})
         update('edit',summary='新提醒',topic='话题甲')
         db = self.service.store.read()
         self.assertEqual(self.service.candidates(db,self.child,'新问题','')[0]['summary'],'新提醒')
@@ -166,7 +168,10 @@ class DialogueTests(unittest.TestCase):
         self.service.conversation_action({'childId':self.child,'conversationId':conv})
         self.assertEqual(self.service.snapshot(self.child)['memories'],[])
         self.assertEqual(self.service.snapshot(self.child)['messages'],[])
-        with self.assertRaises(ProductError): self.service.update_memory(mem,{'childId':self.child,'action':'restore'})
+        deleted = self.service.store.read()['memoryItems'][mem]
+        with self.assertRaises(ProductError) as error:
+            self.service.update_memory(mem,{'childId':self.child,'action':'restore','expectedVersion':deleted['version']})
+        self.assertIn('来源会话', str(error.exception))
         self.service.conversation_action({'childId':self.child,'conversationId':conv,'restore':True})
         self.assertEqual(len(self.service.snapshot(self.child)['memories']),1)
         self.assertEqual(len(self.service.snapshot(self.child)['messages']),2)

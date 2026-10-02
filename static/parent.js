@@ -28,7 +28,10 @@ function parentDraft(message){
  if(d.status==='saving')return '<p class="request-notice">上次保存尚未确认，请先到孩子档案查看，避免重复添加。</p>';
  const saved=JSON.parse(localStorage.getItem('parent-edit-'+state.id+'-'+message.id)||'null')||d;
  const original=state.data.memories.find(m=>m.id===d.memoryId);
- return `<section class="parent-draft"><h3>${d.action==='edit'?'待保存修改':'待保存提醒'}</h3><p class="muted">确认内容后保存，才会影响以后相关回答。</p><form class="parent-draft-form" data-message="${esc(message.id)}" data-memory="${esc(d.memoryId)}" data-version="${esc(saved.expectedVersion??d.expectedVersion??'')}">${original?`<details><summary>查看当前记录</summary><p>${esc(original.summary)}</p><a href="/memory?memory=${encodeURIComponent(original.id)}">打开记录详情</a></details>`:''}${!original||original.kind==='reminder'?`<label>适用话题 <span>（留空表示一般讲法）</span><input name="topic" maxlength="60" value="${esc(saved.topic)}"></label>`:''}${original?.kind==='preference'?`<label>适用范围<select name="scope">${Object.entries(scopeNames).map(([k,v])=>`<option value="${k}" ${saved.scope===k?'selected':''}>${v}</option>`).join('')}</select></label>`:''}<label>内容<textarea name="summary" maxlength="300" rows="3" required>${esc(saved.summary)}</textarea></label><button class="button primary" type="submit">${d.action==='edit'?'保存修改':'保存提醒'}</button> <a class="button" href="/memory">取消</a><p class="form-message" role="status"></p></form></section>`;
+ const scoped=!original||original.kind==='reminder',scope=saved.scope??d.scope??original?.scope??(saved.topic?'topic':'general');
+ const conversationId=saved.conversationId??d.conversationId??original?.conversationId??'';
+ const scopeFields=scoped?reminderScopeFields({scope,conversationId}):original?.kind==='preference'?`<label>适用范围<select name="scope">${Object.entries(scopeNames).map(([k,v])=>`<option value="${k}" ${scope===k?'selected':''}>${v}</option>`).join('')}</select></label>`:'';
+ return `<section class="parent-draft"><h3>${d.action==='edit'?'待保存修改':'待保存提醒'}</h3><p class="muted">确认内容和适用范围后保存，才会影响范围内的相关回答。</p><form class="parent-draft-form" data-message="${esc(message.id)}" data-memory="${esc(d.memoryId)}" data-version="${esc(saved.expectedVersion??d.expectedVersion??'')}">${original?`<details><summary>查看当前记录</summary><p>${esc(original.summary)}</p><a href="/memory?memory=${encodeURIComponent(original.id)}">打开记录详情</a></details>`:''}${!original||original.kind==='reminder'?`<label>话题名称 <span>（选择“相关话题”时填写）</span><input name="topic" maxlength="60" value="${esc(saved.topic)}"></label>`:''}${scopeFields}<label>内容<textarea name="summary" maxlength="300" rows="3" required>${esc(saved.summary)}</textarea></label><button class="button primary" type="submit">${d.action==='edit'?'保存修改':'保存提醒'}</button> <a class="button" href="/memory">取消</a><p class="form-message" role="status"></p></form></section>`;
 }
 function parentAskPage(){
  const v=ensureParent(),params=new URLSearchParams(location.search),record=state.data.memories.find(m=>m.id===params.get('record'));
@@ -42,7 +45,8 @@ function parentAskPage(){
 async function parentSend(text){
  const id=state.id,v=parentView(id);text=text.trim();if(!text||v.sending||v.data?.pending)return;
  const key='parent-outbox-'+id,old=JSON.parse(localStorage.getItem(key)||'null');
- const body=old?.text===text?old:{childId:id,requestId:'parent_'+crypto.randomUUID().replaceAll('-',''),text,recordId:new URLSearchParams(location.search).get('record')||''};
+ const recordId=new URLSearchParams(location.search).get('record')||'';
+ const body=old?.childId===id&&old.text===text&&(old.recordId||'')===recordId?old:{childId:id,requestId:'parent_'+crypto.randomUUID().replaceAll('-',''),text,recordId};
  localStorage.setItem(key,JSON.stringify(body));localStorage.setItem('parent-input-'+id,text);v.sending=true;render();
  try{await api('/api/parent/ask',body);localStorage.removeItem(key);localStorage.setItem('parent-input-'+id,'');v.error='';}
  catch(e){v.error=e.message;toast(e.message);}

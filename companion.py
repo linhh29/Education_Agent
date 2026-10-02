@@ -754,19 +754,50 @@ class CompanionService:
             if not item or item.get("childId") != data.get("childId") or item.get("type") != "dialogue_memory":
                 raise ProductError("没有找到本档案的这条记录。", 404)
             self.profile(db, item["childId"])
+            action = data.get("action", "edit")
+            restoring = action in ("restore", "restore_version")
+            request_id = str(data.get("requestId") or "") if restoring else ""
+            identity = {"childId": item["childId"], "targetId": memory_id, "action": action,
+                        "expectedVersion": str(data.get("expectedVersion")),
+                        "historyIndex": str(data.get("historyIndex")) if action == "restore_version" else None}
+            if request_id:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", request_id):
+                    raise ProductError("恢复请求格式不正确，请重新打开记录。")
+                previous_request = next((x for x in db["parentFeedback"].values() if x.get("requestId") == request_id), None)
+                if previous_request:
+                    if previous_request.get("requestIdentity") != identity:
+                        raise ProductError("这次恢复的目标已改变，请重新选择记录。", 409, "memory_conflict")
+                    return {**copy.deepcopy(item), "replayed": True, "appliedVersion": previous_request["resultVersion"]}
+            if restoring and data.get("expectedVersion") is None:
+                raise ProductError("请先读取记录的当前版本，再执行恢复。", 409, "memory_conflict")
             if data.get("expectedVersion") is not None and str(data["expectedVersion"]) != str(version(item)):
                 raise ProductError("这条记录已在别处更新。你的输入仍保留，请先查看最新记录，再合并修改。", 409, "memory_conflict")
-            action = data.get("action", "edit")
-            if action == "restore":
+            current_version = version(item)
+            fields = ("status", "summary", "quote", "topic", "scope", "parentEdited", "conversationId")
+            current = {k: copy.deepcopy(item.get(k)) for k in fields}
+            current["version"] = current_version
+            if restoring:
                 if any(db["messages"].get(x, {}).get("deleted") for x in item.get("sourceMessageIds", [])):
                     raise ProductError("请先恢复来源会话，再恢复这条记录。", 409)
                 history = item.get("history", [])
-                if not history:
+                if action == "restore_version":
+                    index = data.get("historyIndex")
+                    if isinstance(index, bool) or not re.fullmatch(r"\d+", str(index)) or not 0 <= int(index) < len(history):
+                        raise ProductError("请选择一个存在的历史版本。", 409, "memory_conflict")
+                    previous = copy.deepcopy(history[int(index)])
+                elif item["status"] in ("deleted", "withdrawn"):
+                    allowed = ("observed", "parent_confirmed", "withdrawn") if item["status"] == "deleted" else ("observed", "parent_confirmed")
+                    previous = next((copy.deepcopy(x) for x in reversed(history) if x.get("status") in allowed), None)
+                else:
+                    return {**copy.deepcopy(item), "unchanged": True}
+                if not previous:
                     raise ProductError("没有可恢复的版本。", 409)
-                previous = history.pop()
-                item.update(previous)
+                if item.get("kind") == "reminder":
+                    previous.update(self.reminder_scope(db, item["childId"], previous))
+                item.setdefault("history", []).append(current)
+                item.update({k: previous[k] for k in fields if k in previous})
             else:
-                item.setdefault("history", []).append({k: copy.deepcopy(item.get(k)) for k in ("status", "summary", "quote", "topic", "scope", "parentEdited")})
+                item.setdefault("history", []).append(current)
                 if action in ("withdraw", "delete"):
                     item["status"] = "withdrawn" if action == "withdraw" else "deleted"
                 elif action == "edit":
@@ -778,16 +809,35 @@ class CompanionService:
                         item["scope"] = data["scope"]
                     if item.get("kind") == "reminder":
                         item["quote"] = summary
-                        item["topic"] = str(data.get("topic", item.get("topic")) or "")[:60]
-                        item["scope"] = "general" if not item["topic"] else "topic"
+                        item.update(self.reminder_scope(db, item["childId"], data, existing=item))
                 else:
                     raise ProductError("不支持这项记录操作。")
             item["updatedAt"] = stamp()
-            item["version"] = version(item) + 1
+            item["version"] = current_version + 1
             self.invalidate_pending(db, item["childId"])
             feedback_id = identifier("pf")
             db["parentFeedback"][feedback_id] = {"id": feedback_id, "childId": item["childId"], "targetId": memory_id, "action": action, "createdAt": stamp()}
+            if request_id:
+                db["parentFeedback"][feedback_id].update(requestId=request_id, requestIdentity=identity, resultVersion=item["version"])
             return copy.deepcopy(item)
+
+    @staticmethod
+    def reminder_scope(db, child_id, data, existing=None):
+        topic = str(data.get("topic", (existing or {}).get("topic", "")) or "").strip()[:60]
+        # Legacy forms infer scope from topic; an existing session binding must
+        # survive editing its text. Explicit scope is never silently widened.
+        scope = data.get("scope") or ("conversation" if (existing or {}).get("scope") == "conversation" else "topic" if topic else "general")
+        if scope not in ("conversation", "topic", "general"):
+            raise ProductError("请选择提醒的适用范围。")
+        if scope == "topic" and not topic:
+            raise ProductError("话题提醒需要填写适用话题。")
+        conversation_id = None
+        if scope == "conversation":
+            conversation_id = str(data.get("conversationId", (existing or {}).get("conversationId")) or "")
+            conversation = db["conversations"].get(conversation_id, {})
+            if not conversation_id or conversation.get("childId") != child_id or conversation.get("deleted"):
+                raise ProductError("请选择本档案中这条提醒适用的聊天；未选择时不会保存为长期提醒。", 409, "reminder_conversation")
+        return {"topic": topic, "scope": scope, "conversationId": conversation_id}
 
     def add_reminder(self, data):
         summary = str(data.get("summary") or "").strip()
@@ -796,9 +846,10 @@ class CompanionService:
         with self.store.transaction() as db:
             child_id = str(data.get("childId"))
             self.profile(db, child_id)
-            topic, memory_id = str(data.get("topic") or "").strip()[:60], identifier("mem")
+            scope = self.reminder_scope(db, child_id, data)
+            memory_id = identifier("mem")
             item = {"id": memory_id, "childId": child_id, "type": "dialogue_memory", "kind": "reminder", "summary": summary,
-                    "topic": topic, "scope": "topic" if topic else "general", "quote": summary, "sourceMessageIds": [],
+                    **scope, "quote": summary, "sourceMessageIds": [],
                     "status": "parent_confirmed", "parentEdited": True, "sourceActor": "parent", "version": 1,
                     "createdAt": stamp(), "updatedAt": stamp(), "history": []}
             db["memoryItems"][memory_id] = item

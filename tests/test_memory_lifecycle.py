@@ -92,7 +92,7 @@ class MemoryLifecycleTests(unittest.TestCase):
         context=self.contexts[-1][1]
         self.assertNotIn('旧讲法留下的特殊描述',json.dumps(context,ensure_ascii=False))
         self.assertEqual(context['candidateMemories'][0]['summary'],'修改后的讲法')
-        restored=self.update(reminder,'restore')
+        restored=self.update(reminder,'restore_version',historyIndex=0,expectedVersion=revised['version'])
         self.assertEqual(restored['version'],3)
         self.assertEqual(restored['summary'],reminder['summary'])
 
