@@ -211,8 +211,9 @@ class ParentService:
         conversations = sorted((c for c in db["conversations"].values() if c.get("childId") == child_id and not c.get("deleted")), key=lambda c: c["startedAt"], reverse=True)
         raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
         history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
-        def parent_history(limit):
-            return [{"role": m["role"], "speaker": "parent" if m["role"] == "user" else "parent_assistant", "text": m["text"][:limit]} for m in history]
+        def parent_history(limit, parent_only=False):
+            return [{"role": m["role"], "speaker": "parent" if m["role"] == "user" else "parent_assistant", "text": m["text"][:limit]}
+                    for m in history if not parent_only or m["role"] == "user"]
         current_activity = self.current_activity(db, child_id)
         def record_view(m, include_quote=False):
             value = memory_view(m, include_quote)
@@ -290,7 +291,7 @@ class ParentService:
                     add_record(db["memoryItems"][r["id"]])
         previous_activity = None
         activity_intent = selected.get("activityIntent", "continue" if selected.get("inheritActivity") else "none")
-        if activity_intent == "continue":
+        if activity_intent in ("continue", "retain"):
             previous = current_activity
             if previous and all(self.within(db["messages"].get(mid, {}).get("createdAt"), first, last) for mid in previous.get("sourceMessageIds", [])):
                 previous_activity = previous["activity"]
@@ -301,7 +302,10 @@ class ParentService:
         context = {"question": request["text"], "questionSpeaker": "parent", "child": {"nickname": profile["nickname"], "age": profile["age"]},
                    "now": now.isoformat(), "timezone": str(TZ), "activityIntent": activity_intent,
                    "timeWindow": label, "partial": partial, "evidence": list(evidence.values()), "summaries": summaries,
-                   "parentHistory": parent_history(600), "previousActivity": previous_activity}
+                   # For confirmations/readbacks, the saved plan supplies its
+                   # content; older AI paraphrases must not become new constraints.
+                   "parentHistory": parent_history(600, parent_only=activity_intent == "retain"),
+                   "previousActivity": previous_activity}
         if len(json.dumps(context, ensure_ascii=False).encode()) > 28000:
             raise self.error("相关记录较多，请缩小到一个话题或时间段再问。", 400, "parent_capacity")
         inherited = ({"memoryVersions": previous.get("memoryVersions", []), "sourceMessageIds": previous.get("sourceMessageIds", [])}
@@ -330,8 +334,8 @@ class ParentService:
             used = set(result.get("usedEvidenceIds", [])) | set(sources)
             if any(s not in evidence for s in used):
                 raise self.error("这次回答的依据未能核对，请重试。", 502, "parent_sources")
-            # An unrelated query cannot replace the discussion object merely
-            # because the answer model repeats a previously visible activity.
+            # Timing-only confirmations/readbacks and unrelated queries cannot
+            # replace the plan even if the answer model returns another card.
             activity = result.get("activity") if context["activityIntent"] in ("new", "continue") else None
             if activity:
                 if not all(isinstance(activity.get(k), str) and activity[k].strip() for k in ("title", "materials", "steps", "adultAction", "why")):
@@ -353,7 +357,8 @@ class ParentService:
                 draft["status"] = "pending"
                 if draft["action"] == "edit":
                     used.add(draft["memoryId"])
-            inherited = dependencies.pop("inheritedActivity") if activity else {"memoryVersions": [], "sourceMessageIds": []}
+            inherited = (dependencies.pop("inheritedActivity") if activity or context["activityIntent"] == "retain"
+                         else {"memoryVersions": [], "sourceMessageIds": []})
             dependencies.pop("inheritedActivity", None)
             refs = {r["id"]: r for r in dependencies["memoryVersions"] if r["id"] in used}
             refs.update({r["id"]: r for r in inherited["memoryVersions"]})
@@ -368,7 +373,8 @@ class ParentService:
                     raise self.error("依据刚有更新，请重新提问。", 409)
                 mid = identifier("parent")
                 db["parentMessages"][mid] = {"id": mid, "childId": request["childId"], "role": "assistant", "text": answer,
-                    "advice": clean_advice(result.get("advice")), "sources": sources, "activity": activity, "draft": draft,
+                    "advice": "" if context["activityIntent"] == "retain" else clean_advice(result.get("advice")),
+                    "sources": sources, "activity": activity, "draft": draft,
                     "requestId": r["id"], "createdAt": stamp(), "model": meta.get("model"), **dependencies}
                 r.update(status="completed", finishedAt=stamp())
         except Exception as exc:

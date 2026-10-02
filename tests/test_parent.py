@@ -168,6 +168,58 @@ class ParentTests(unittest.TestCase):
         self.ask(self.response(answer='好，结束这项活动。'), self.selector(activityIntent='clear'))
         self.assertIsNone(self.s.parent.snapshot(self.a)['activity'])
 
+    def test_activity_timing_and_readback_keep_plan_without_another_card(self):
+        reminder = self.s.add_reminder({'childId': self.a, 'summary': '只在桌面观察，不用工具'})
+        activity = {'title': '比较纸的形状', 'materials': '一张纸',
+                    'steps': '1. 把纸平放。\n2. 折起后看看形状有什么不同。',
+                    'adultAction': '家长陪同折纸。', 'why': '观察折叠前后的形状。',
+                    'constraints': ['桌面观察', '不用工具']}
+        self.ask(self.response(activity=activity, sources=[reminder['id']]),
+                 self.selector(memoryIds=[reminder['id']], activityIntent='new'))
+        before = self.child_state()
+        accidental_rewrite = {**activity, 'materials': '其他材料', 'steps': '换了一个观察。'}
+        paused, contexts = self.ask(
+            self.response(answer='好，留到有空时再做，方案保留。', sources=[], activity=accidental_rewrite,
+                          advice='再多准备一种材料。'),
+            self.selector(activityIntent='retain'), text='先放一放，有空再按原来的方案做。')
+        self.assertEqual(contexts[-1][1]['previousActivity'], activity)
+        self.assertTrue(any(m['role'] == 'assistant' for m in contexts[0][1]['parentHistory']))
+        self.assertTrue(contexts[-1][1]['parentHistory'])
+        self.assertTrue(all(m['role'] == 'user' for m in contexts[-1][1]['parentHistory']))
+        self.assertIsNone(paused['messages'][-1]['activity'])
+        self.assertEqual(paused['messages'][-1]['advice'], '')
+        self.assertEqual({k: paused['activity'][k] for k in activity}, activity)
+        paused_id = paused['messages'][-1]['id']
+        self.assertEqual(self.s.store.read()['parentMessages'][paused_id]['memoryVersions'],
+                         [{'id': reminder['id'], 'version': 1}])
+        for _ in range(4):
+            self.ask(self.response(sources=[]), self.selector(activityIntent='none'))
+        recalled, contexts = self.ask(self.response(answer=activity['steps'], sources=[]),
+                                     self.selector(activityIntent='retain'), text='刚才定好的步骤是什么？')
+        self.assertEqual(contexts[-1][1]['previousActivity'], activity)
+        self.assertEqual(recalled['messages'][-1]['text'], activity['steps'])
+        self.assertEqual({k: recalled['activity'][k] for k in activity}, activity)
+        self.assertEqual(self.child_state(), before)
+        self.assertIsNone(self.s.parent.snapshot(self.b)['activity'])
+        self.s.update_memory(reminder['id'], {'childId': self.a, 'action': 'withdraw'})
+        snapshot = self.s.parent.snapshot(self.a)
+        self.assertIsNone(snapshot['activity'])
+        self.assertTrue(next(m for m in snapshot['messages'] if m['id'] == paused_id)['stale'])
+
+    def test_paused_activity_can_still_be_changed_or_replaced(self):
+        original = {'title': '纸的形状', 'materials': '纸', 'steps': '把纸折起再展开。',
+                    'adultAction': '家长陪同。', 'why': '观察形状变化。', 'constraints': ['不用工具']}
+        changed = {'title': '比较积木形状', 'materials': '两块大积木', 'steps': '并排放好，看看形状的不同。',
+                   'adultAction': '家长放好积木。', 'why': '观察不同形状。', 'constraints': ['不用纸']}
+        for intent in ('continue', 'new'):
+            with self.subTest(intent=intent):
+                self.ask(self.response(activity=original), self.selector(activityIntent='new'))
+                self.ask(self.response(answer='可以以后再做。'), self.selector(activityIntent='retain'))
+                result, contexts = self.ask(self.response(activity=changed),
+                    self.selector(activityIntent=intent), text='以后也不用纸，换成积木来观察。')
+                self.assertEqual({k: result['activity'][k] for k in changed}, changed)
+                self.assertEqual(contexts[-1][1]['previousActivity'], original if intent == 'continue' else None)
+
     def test_foreign_selection_and_fabricated_citation_cannot_escape_profile(self):
         result, contexts = self.ask(self.response(sources=['ucb']), self.selector(conversationIds=['cb']))
         self.assertEqual(contexts[-1][1]['evidence'], [])
