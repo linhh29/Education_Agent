@@ -65,6 +65,23 @@ class DialogueTests(unittest.TestCase):
             self.assertEqual(answer['text'], response['answer'])
             self.assertEqual(bool(answer.get('suggestion')), allowed)
 
+    def test_historical_activity_uses_current_guard_without_reviving_older_activity(self):
+        response, meta = self.answer()
+        response['suggestion'] = {'title': '旧观察', 'steps': '家长拿纸，孩子看形状。', 'why': '观察形状'}
+        first = self.chat(self.request(), (response, meta))['snapshot']['messages'][-1]
+        second = self.chat(self.request())['snapshot']['messages'][-1]
+        old_unsafe = {'title': '镜子反光', 'steps': '拿镜子对着太阳，注意不要照到眼睛。', 'why': '看反光'}
+        with self.service.store.transaction() as db:
+            db['messages'][second['id']]['suggestion'] = old_unsafe
+        before = self.service.store.read()
+        with patch.object(self.service.model, 'complete', side_effect=AssertionError('read called model')):
+            snapshot = self.service.snapshot(self.child)
+        views = {m['id']: m for m in snapshot['messages']}
+        self.assertTrue(views[first['id']]['suggestionEligible'])
+        self.assertFalse(views[second['id']]['suggestionEligible'])
+        self.assertIsNone(snapshot['suggestion'])
+        self.assertEqual(self.service.store.read(), before)
+
     def test_exact_quote_grounds_memory_and_invalid_quote_is_discarded(self):
         req = self.request('我没明白其中的关系')
         valid = {'kind':'confusion','quote':'没明白其中的关系','summary':'这次关系还没有讲明白'}

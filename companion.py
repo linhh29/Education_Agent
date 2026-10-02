@@ -375,7 +375,9 @@ class CompanionService:
             item["effectiveScope"] = effective_scope(item)
             item["evidenceStale"] = item["id"] in invalid and item.get("status") not in ("withdrawn", "deleted")
         for message in messages:
-            message["suggestionEligible"] = message["id"] not in blocked
+            # Historical detail uses this flag too: a saved suggestion may
+            # predate the current action guard. Preserve the original record.
+            message["suggestionEligible"] = message["id"] not in blocked and bool(safe_suggestion(message.get("suggestion")))
         for conv in conversations:
             if conv.get("exploration", {}).get("status") == "ready" and not exploration_valid(db, conv, blocked):
                 conv["exploration"]["status"] = "stale"
@@ -384,7 +386,7 @@ class CompanionService:
         pending = next((x for x in db["requests"].values() if x.get("childId") == child_id and x.get("status") == "pending"), None)
         last_request = next((x for x in reversed(list(db["requests"].values())) if x.get("childId") == child_id and active and x.get("conversationId") == active["id"]), None)
         recent_answers = [x for x in messages if x.get("role") == "assistant"][-6:]
-        suggestion_message = next((x for x in reversed(recent_answers) if safe_suggestion(x.get("suggestion"))), None)
+        suggestion_message = next((x for x in reversed(recent_answers) if x.get("suggestion")), None)
         suggestion_stale = bool(suggestion_message and not suggestion_message["suggestionEligible"])
         if suggestion_stale:
             suggestion_message = None  # Do not resurrect an older activity after a withdrawal.

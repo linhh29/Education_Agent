@@ -7,6 +7,7 @@ import copy
 import json
 import re
 import threading
+import unicodedata
 from datetime import datetime, timedelta, date
 import calendar
 from zoneinfo import ZoneInfo
@@ -15,6 +16,12 @@ from memory_support import (active, validity, version, reference, dependencies_v
                             exploration_valid, exploration_view, memory_view)
 
 TZ = ZoneInfo("Asia/Shanghai")
+
+
+def clean_advice(value):
+    """Hide empty/punctuation-only advice, including already saved replies."""
+    text = str(value or "").strip()[:2000]
+    return text if any(unicodedata.category(char)[0] in "LNS" for char in text) else ""
 
 
 def local_time(value):
@@ -78,6 +85,7 @@ class ParentService:
         visible = []
         for m in messages[-40:]:
             value = {k: copy.deepcopy(m[k]) for k in ("id", "role", "text", "advice", "activity", "draft", "createdAt", "requestId", "timeWindow", "partial") if k in m}
+            value["advice"] = clean_advice(value.get("advice"))
             value["stale"] = m["role"] == "assistant" and not self.valid_result(db, m, child_id)
             source_ids = m.get("sources", [])
             if m.get("activity") and not source_ids:
@@ -202,6 +210,8 @@ class ParentService:
         conversations = sorted((c for c in db["conversations"].values() if c.get("childId") == child_id and not c.get("deleted")), key=lambda c: c["startedAt"], reverse=True)
         raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
         history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
+        def parent_history(limit):
+            return [{"role": m["role"], "speaker": "parent" if m["role"] == "user" else "parent_assistant", "text": m["text"][:limit]} for m in history]
         current_activity = self.current_activity(db, child_id)
         def record_view(m, include_quote=False):
             value = memory_view(m, include_quote)
@@ -214,7 +224,7 @@ class ParentService:
             msgs = [m for m in raw if m["conversationId"] == c["id"]]
             directory["conversations"].append({"id": c["id"], "topic": c.get("title"), "startedAt": local_time(c["startedAt"]),
                 "lastAt": local_time(msgs[-1]["createdAt"] if msgs else c["startedAt"]),
-                "questions": [m["text"][:120] for m in msgs if m["role"] == "user"][-8:]})
+                "questionSpeaker": "child", "questions": [m["text"][:120] for m in msgs if m["role"] == "user"][-8:]})
         partial = len(records) > 40 or len(conversations) > 40
         while len(json.dumps(directory, ensure_ascii=False).encode()) > 18000:
             key = max(directory, key=lambda k: len(json.dumps(directory[k], ensure_ascii=False)))
@@ -222,11 +232,11 @@ class ParentService:
             partial = True
         now = datetime.fromisoformat(request["createdAt"]).astimezone(TZ)
         previous_window = next((m.get("dateWindow") for m in reversed(history) if m.get("dateWindow")), None)
-        selected, _ = self.model.complete({"now": now.isoformat(), "question": request["text"],
+        selected, _ = self.model.complete({"now": now.isoformat(), "question": request["text"], "questionSpeaker": "parent",
             "recordId": request.get("recordId"), "directory": directory, "partial": partial,
             "currentActivity": current_activity["activity"] if current_activity else None,
             "previousWindow": previous_window,
-            "parentHistory": [{"role": m["role"], "text": m["text"][:500]} for m in history]}, request["id"], purpose="parent_select")
+            "parentHistory": parent_history(500)}, request["id"], purpose="parent_select")
         try:
             first, last, label = self.window(selected, now, request["text"], previous_window)
         except (ValueError, TypeError, KeyError) as exc:
@@ -236,7 +246,8 @@ class ParentService:
         def add_message(m):
             if m["id"] in evidence:
                 return
-            evidence[m["id"]] = {"id": m["id"], "type": "message", "role": m["role"], "text": m["text"][:1600], "createdAt": local_time(m["createdAt"])}
+            evidence[m["id"]] = {"id": m["id"], "type": "message", "role": m["role"],
+                "speaker": "child" if m["role"] == "user" else "child_assistant", "text": m["text"][:1600], "createdAt": local_time(m["createdAt"])}
             message_ids.add(m["id"])
 
         def add_record(m):
@@ -286,10 +297,10 @@ class ParentService:
                     add_record(db["memoryItems"][r["id"]])
                 for mid in previous.get("sourceMessageIds", []):
                     add_message(db["messages"][mid])
-        context = {"question": request["text"], "child": {"nickname": profile["nickname"], "age": profile["age"]},
+        context = {"question": request["text"], "questionSpeaker": "parent", "child": {"nickname": profile["nickname"], "age": profile["age"]},
                    "now": now.isoformat(), "timezone": str(TZ), "activityIntent": activity_intent,
                    "timeWindow": label, "partial": partial, "evidence": list(evidence.values()), "summaries": summaries,
-                   "parentHistory": [{"role": m["role"], "text": m["text"][:600]} for m in history], "previousActivity": previous_activity}
+                   "parentHistory": parent_history(600), "previousActivity": previous_activity}
         if len(json.dumps(context, ensure_ascii=False).encode()) > 28000:
             raise self.error("相关记录较多，请缩小到一个话题或时间段再问。", 400, "parent_capacity")
         inherited = ({"memoryVersions": previous.get("memoryVersions", []), "sourceMessageIds": previous.get("sourceMessageIds", [])}
@@ -356,7 +367,7 @@ class ParentService:
                     raise self.error("依据刚有更新，请重新提问。", 409)
                 mid = identifier("parent")
                 db["parentMessages"][mid] = {"id": mid, "childId": request["childId"], "role": "assistant", "text": answer,
-                    "advice": str(result.get("advice") or "")[:2000], "sources": sources, "activity": activity, "draft": draft,
+                    "advice": clean_advice(result.get("advice")), "sources": sources, "activity": activity, "draft": draft,
                     "requestId": r["id"], "createdAt": stamp(), "model": meta.get("model"), **dependencies}
                 r.update(status="completed", finishedAt=stamp())
         except Exception as exc:

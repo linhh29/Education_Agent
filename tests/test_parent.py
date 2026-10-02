@@ -75,6 +75,44 @@ class ParentTests(unittest.TestCase):
         result, contexts = self.ask(self.response(answer='该时段没有可用资料。', sources=[]), self.selector(mode='range', fromDate='2019-01-01', toDate='2019-01-02', timeQuote='2019年1月1日至1月2日'), text='2019年1月1日至1月2日')
         self.assertEqual(contexts[-1][1]['evidence'], [])
 
+    def test_parent_context_keeps_speakers_and_editors_separate(self):
+        reminder = self.s.add_reminder({'childId': self.a, 'summary': '以后用家里的物品举例'})
+        now = stamp()
+        with self.s.store.transaction() as db:
+            db['messages']['aca'] = {**db['messages']['uca'], 'id': 'aca', 'role': 'assistant', 'text': 'AI的解释'}
+            db['memoryItems']['edited'] = {'id': 'edited', 'childId': self.a, 'type': 'dialogue_memory', 'kind': 'confusion',
+                'status': 'parent_confirmed', 'summary': '家长修订的有限判断', 'quote': '我没明白为什么会倒', 'scope': 'conversation',
+                'conversationId': 'ca', 'sourceMessageIds': ['uca'], 'sourceActor': 'child', 'parentEdited': True, 'version': 1, 'updatedAt': now}
+            for role, text in [('user', '以后用家里的物品举例'), ('assistant', '旧AI误称孩子提问是家长要求')]:
+                db['parentMessages'][role] = {'id': role, 'childId': self.a, 'role': role, 'text': text, 'createdAt': now}
+        before = self.child_state()
+        result, contexts = self.ask(selection=self.selector(memoryIds=[reminder['id'], 'edited']))
+        self.assertEqual(self.child_state(), before)
+        self.assertIsNone(result['messages'][-1]['draft'])
+        for _, context in contexts:
+            self.assertEqual(context['questionSpeaker'], 'parent')
+            self.assertEqual([m['speaker'] for m in context['parentHistory']], ['parent', 'parent_assistant'])
+        self.assertEqual(contexts[0][1]['directory']['conversations'][0]['questionSpeaker'], 'child')
+        evidence = {m['id']: m for m in contexts[-1][1]['evidence']}
+        self.assertEqual(evidence['uca']['speaker'], 'child')
+        self.assertEqual(evidence['aca']['speaker'], 'child_assistant')
+        self.assertEqual(evidence[reminder['id']]['sourceActor'], 'parent')
+        self.assertEqual(evidence['edited']['sourceActor'], 'child')
+        self.assertEqual(evidence['edited']['summaryActor'], 'parent')
+
+    def test_empty_advice_is_omitted_on_write_and_old_reads_without_recalling_model(self):
+        for value in ['', '  ', ',，。…！—\n\u200b', '看看。', '好。', '1分钟', '👀']:
+            result, contexts = self.ask(self.response(advice=value))
+            expected = '' if value in ['', '  ', ',，。…！—\n\u200b'] else value
+            self.assertEqual(result['messages'][-1]['advice'], expected)
+            self.assertEqual([p for p, _ in contexts], ['parent_select', 'parent_answer'])
+        mid = result['messages'][-1]['id']
+        with self.s.store.transaction() as db:
+            db['parentMessages'][mid]['advice'] = ',，'
+        with patch.object(self.s.model, 'complete', side_effect=AssertionError('read called model')):
+            self.assertEqual(self.s.parent.snapshot(self.a)['messages'][-1]['advice'], '')
+        self.assertEqual(self.s.store.read()['parentMessages'][mid]['advice'], ',，')
+
     def test_calendar_ranges_use_server_local_date_not_model_year(self):
         now = datetime.fromisoformat('2026-10-01T16:01:00+00:00')
         for mode, offset, start, end in [('day', 0, '2026-10-02', '2026-10-02'), ('day', -1, '2026-10-01', '2026-10-01'), ('week', -1, '2026-09-21', '2026-09-27')]:
