@@ -29,7 +29,7 @@ test('memory list separates current scope, old conversation scope and withdrawn 
  const [main,secondary]=p.root.innerHTML.split('<details class="past-records">');
  assert.match(main,/仍有效的提醒/);
  for(const text of ['只限旧聊天','撤回的提醒','依据已变']){assert.ok(!main.includes(text));assert.ok(secondary.includes(text));}
- assert.match(secondary,/仅这次聊天/);
+ assert.match(secondary,/仅用于旧聊天/);
 });
 test('an invalid latest activity does not reveal an older activity; empty summary omitted',()=>{
  const p=page();

@@ -219,6 +219,7 @@ main:has(>.parent-tabs){max-width:880px}
 .parent-draft h3,.parent-advice h3{font-size:16px;margin:0 0 6px}
 .parent-draft details{margin-bottom:14px}
 .parent-draft-form .button{margin-top:8px}
+[data-conversation-field][hidden]{display:none}
 .parent-draft-form label{display:block;margin:12px 0 5px}
 .parent-draft-form input,.parent-draft-form textarea,.parent-draft-form select{margin-top:6px;width:100%}
 .parent-compose-footer{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-top:10px}

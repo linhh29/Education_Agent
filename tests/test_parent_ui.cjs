@@ -11,7 +11,7 @@ function page(){
   location:{search:'?view=ask&record=A'},
   localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)},
   esc:value=>String(value??'').replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;'),
-  timeLabel:()=> '今天',conversationTitle:c=>c.title,scopeNames:{conversation:'仅这次聊天',topic:'相关话题',general:'日常讲法'},
+  timeLabel:()=> '今天',conversationTitle:c=>c.title,scopeNames:{conversation:'仅这段聊天',topic:'这个话题',general:'一般讲解偏好'},
   state:{id:'childA',data:{memories:[],conversations:[{id:'latest',title:'最新聊天'},{id:'chosen',title:'明确选择的聊天'}]}},
   render(){},toast(){},path:()=>'/parent',
   api:async(path,body)=>{sent.push({path,body:JSON.parse(JSON.stringify(body))});throw Error('模拟响应丢失');}
@@ -60,7 +60,7 @@ test('same words from another child or no selected record form distinct requests
 test('conversation draft exposes scope and asks for a choice without selecting newest conversation',()=>{
  const p=page();
  let html=p.run("parentDraft({id:'m',draft:{status:'pending',action:'add',summary:'本次提醒',topic:'',scope:'conversation'}})");
- assert.match(html,/<option value="conversation" selected>仅这次聊天/);
+ assert.match(html,/<option value="conversation" selected>仅这段聊天/);
  assert.match(html,/<option value="">请选择聊天/);
  assert.ok(!/<option value="latest" selected>/.test(html));
  p.store.set('parent-edit-childA-m',JSON.stringify({summary:'本次提醒',scope:'conversation',conversationId:'chosen'}));
