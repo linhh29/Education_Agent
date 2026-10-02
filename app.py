@@ -2,11 +2,12 @@
 """好奇心 Agent - zero-dependency local online demo server.
 
 Run: python3 app.py
-Open: http://127.0.0.1:8787/setup
+Open: http://127.0.0.1:8788/setup
 """
 from __future__ import annotations
 
 import hashlib
+import errno
 import hmac
 import fcntl
 import ipaddress
@@ -34,7 +35,7 @@ from companion import CompanionService, ProductError
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 _db_override = os.environ.get("EDUCATION_AGENT_DB", "").strip()
-DB_PATH = (Path(_db_override).expanduser() if _db_override else DATA_DIR / "demo-db.json")
+DB_PATH = (Path(_db_override).expanduser() if _db_override else DATA_DIR / "local-db.json")
 if not DB_PATH.is_absolute():
     DB_PATH = (ROOT / DB_PATH).resolve()
 SHOWCASE_DB_PATH = DATA_DIR / "showcase-child-24days.json"
@@ -428,6 +429,12 @@ def seed_db() -> Dict[str, Any]:
         "safetyEvents": {},
         "showcases": {},
     }
+
+
+def empty_db() -> Dict[str, Any]:
+    """Fresh product installs start without example profiles or conversations."""
+    return {name: {} for name in ("profiles", "conversations", "messages", "memoryItems",
+                                 "parentFeedback", "safetyEvents", "showcases")}
 
 
 def load_db() -> Dict[str, Any]:
@@ -4326,7 +4333,7 @@ PRODUCT = None
 
 def main() -> None:
     global PRODUCT
-    port = int(os.environ.get("PORT", "8787"))
+    port = int(os.environ.get("PORT", "8788"))
     host = os.environ.get("HOST", "127.0.0.1")
     if host != "127.0.0.1":
         raise ValueError("本轮本机演示只绑定 127.0.0.1")
@@ -4337,8 +4344,14 @@ def main() -> None:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("这份演示数据已在运行，请使用已打开的页面，或为另一进程指定独立 EDUCATION_AGENT_DB。")
-        with ThreadingHTTPServer((host, port), Handler) as server:
-            PRODUCT = CompanionService(ROOT, DB_PATH, seed_db)
+        try:
+            server = ThreadingHTTPServer((host, port), Handler)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise SystemExit(f"端口 {port} 已被占用。请使用已有页面，或用 PORT 指定空闲端口后启动；不会停止其他程序。")
+            raise
+        with server:
+            PRODUCT = CompanionService(ROOT, DB_PATH, empty_db)
             print(f"好奇心伙伴 running at http://{host}:{port}/setup", flush=True)
             try:
                 server.serve_forever()
@@ -4349,4 +4362,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ProductError, OSError, ValueError) as exc:
+        raise SystemExit(f"启动失败：{exc}。请检查本地配置、目录读写权限及端口。")

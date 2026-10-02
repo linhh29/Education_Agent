@@ -217,7 +217,7 @@ class BudgetTests(unittest.TestCase):
         with patch('companion.build_opener') as opener:
             with self.assertRaises(ProductError):self.client.complete({'currentText':'合成问题'},'test_request')
             opener.assert_not_called()
-        self.assertEqual(self.client.occupied(),2.735356)
+        self.assertEqual(self.client.occupied(),0)
 
     def test_other_confirmed_spending_reduces_headroom_and_cannot_be_reset(self):
         config_path=self.client.root/'config/runtime.json'
@@ -225,11 +225,11 @@ class BudgetTests(unittest.TestCase):
         config['budget']['prior_cny']+=1
         config_path.write_text(json.dumps(config))
         updated=ModelClient(self.client.root)
-        self.assertAlmostEqual(updated.occupied(),3.735356)
-        self.assertAlmostEqual(updated.limit(),49.735356)
-        config['budget']['prior_cny']=2.735356
+        self.assertAlmostEqual(updated.occupied(),1)
+        self.assertAlmostEqual(updated.limit(),50)
+        config['budget']['prior_cny']=0
         config_path.write_text(json.dumps(config))
-        self.assertAlmostEqual(ModelClient(self.client.root).occupied(),3.735356)
+        self.assertAlmostEqual(ModelClient(self.client.root).occupied(),1)
 
     def test_unknown_timeout_keeps_positive_reservation_and_no_automatic_retry(self):
         with patch('companion.build_opener') as opener:

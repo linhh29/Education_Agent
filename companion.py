@@ -145,9 +145,17 @@ REPLY_SCHEMA = {
 
 class ModelClient:
     def __init__(self, root):
-        self.root = Path(root)
-        self.config = json.loads((self.root / "config/runtime.json").read_text("utf-8"))
+        self.root = Path(root).resolve()
+        local_config = self.root / "config/runtime.local.json"
+        config_path = self.private_path(os.environ.get("EDUCATION_AGENT_CONFIG", "") or
+                                        (local_config if local_config.exists() else "config/runtime.json"))
+        try:
+            self.config = json.loads(config_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            raise ProductError("本机运行配置无法读取，请检查 EDUCATION_AGENT_CONFIG 或 config/runtime.local.json。", 503, "model_config")
         c = self.config
+        key_file = os.environ.get("EDUCATION_AGENT_KEY_FILE", c.get("key_file", "")).strip()
+        c["key_file"] = str(self.private_path(key_file)) if key_file else ""
         if c["base_url"] != "https://dashscope.aliyuncs.com/compatible-mode/v1" or c["model"] != "qwen3.8-max-0902":
             raise ProductError("本轮只授权指定 DashScope 模型，请恢复 runtime.json 配置。", 503, "model_config")
         if not isinstance(c["enable_thinking"], bool) or not 256 <= c["max_completion_tokens"] <= 3000 or not 1 <= c["timeout_seconds"] <= 30 or not 128 <= c.get("thinking_budget", 1024) <= 1024:
@@ -155,23 +163,28 @@ class ModelClient:
         b = c["budget"]
         if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) for value in b.values()):
             raise ProductError("预算配置必须是明确的有限金额。", 503, "budget_config")
-        if b["prior_cny"] < 2.735356 or b["additional_limit_cny"] > 47 or b["total_limit_cny"] > 50 or b["input_cny_per_million"] < 12 or b["output_cny_per_million"] < 36:
+        if b["prior_cny"] < 0 or not 0 < b["additional_limit_cny"] <= 50 or not 0 < b["total_limit_cny"] <= 50 or b["input_cny_per_million"] < 12 or b["output_cny_per_million"] < 36:
             raise ProductError("预算配置超出已授权范围。", 503, "budget_config")
-        self.ledger = JsonStore(self.root / "logs/llm-usage.json", lambda: {"priorCny": b["prior_cny"], "calls": {}})
+        ledger_path = self.private_path(os.environ.get("EDUCATION_AGENT_LEDGER", "") or "logs/llm-usage.json")
+        self.ledger = JsonStore(ledger_path, lambda: {"priorCny": b["prior_cny"], "calls": {}})
         with self.ledger.transaction() as ledger:
             # Include newly confirmed spending elsewhere, never lower occupancy.
             self.ledger_occupied(ledger)
             ledger["priorCny"] = max(float(ledger["priorCny"]), b["prior_cny"])
 
+    def private_path(self, value):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else self.root / path
+
     def public_status(self):
         c = self.config
         occupied = self.occupied()
-        return {"model": c["model"], "mode": "真实文字 · 有界思考" if c["enable_thinking"] else "真实文字 · 非思考模式", "keyConfigured": Path(c["key_file"]).is_file(),
+        return {"model": c["model"], "mode": "真实文字 · 有界思考" if c["enable_thinking"] else "真实文字 · 非思考模式", "keyConfigured": bool(c["key_file"]) and Path(c["key_file"]).is_file(),
                 "occupiedCny": round(occupied, 6), "limitCny": self.limit(), "timeoutSeconds": c["timeout_seconds"]}
 
     def limit(self):
         b = self.config["budget"]
-        return min(b["total_limit_cny"], 2.735356 + b["additional_limit_cny"])
+        return min(b["total_limit_cny"], b["prior_cny"] + b["additional_limit_cny"])
 
     def occupied(self):
         return self.ledger_occupied(self.ledger.read())
@@ -186,6 +199,8 @@ class ModelClient:
                 raise ProductError("本轮云语音预算已到上限。可以继续文字提问或查看已保存的回答。", 402, "speech_budget")
 
     def read_key(self):
+        if not self.config["key_file"]:
+            raise ProductError("尚未配置模型Key，请设置后端 EDUCATION_AGENT_KEY_FILE 后重启；已有资料仍可查看。", 503, "key_unavailable")
         try:
             key = Path(self.config["key_file"]).read_text("utf-8").strip()
         except OSError:

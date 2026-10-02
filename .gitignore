@@ -5,6 +5,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.venv/
+.secrets/
+config/runtime.local.json
 
 config/models.json
 data/demo-db.json
