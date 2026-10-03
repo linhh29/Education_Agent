@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import app
 from companion import CompanionService, ProductError, stamp
-from parent_support import ParentService, clean_advice
+from parent_support import ParentService, clean_advice, clean_parent_prose
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -451,6 +451,152 @@ class ParentTests(unittest.TestCase):
         saved = self.s.parent.save_draft({'childId': self.a, 'messageId': retried['messages'][-1]['id'],
             'summary': draft['summary'], 'scope': 'general', 'topic': ''})
         self.assertEqual(self.s.store.read()['memoryItems'][saved['memoryId']]['summary'], draft['summary'])
+
+    def preference_summary(self):
+        """Same graph as the manual trial: old preference survives in summary refs."""
+        with self.s.store.transaction() as db:
+            source = db['messages']['uca']
+            source['text'] = '比起恐龙，我更喜欢海豚。'
+            db['messages']['correction'] = {**source, 'id': 'correction',
+                'text': '刚才说错了，比起海豚，我其实更喜欢恐龙。'}
+            for mid, message in [('pref_old', source), ('pref_new', db['messages']['correction'])]:
+                db['memoryItems'][mid] = {'id': mid, 'childId': self.a, 'type': 'dialogue_memory',
+                    'kind': 'preference', 'scope': 'general', 'status': 'observed', 'version': 1,
+                    'quote': message['text'], 'summary': message['text'], 'scopeEvidence': message['text'],
+                    'evidenceBasis': 'independent_expression', 'sourceMessageIds': [message['id']],
+                    'updatedAt': stamp()}
+            db['memoryItems']['pref_new']['supersedes'] = [{'id': 'pref_old', 'version': 1}]
+            db['conversations']['ca']['exploration'] = {'status': 'ready', 'version': 1,
+                'fingerprint': 'first-summary', 'topic': '动物偏好',
+                'focus': {'text': '孩子先说喜欢海豚，随后纠正为恐龙。', 'sourceMessageIds': ['uca', 'correction']},
+                'difficulties': [], 'attempts': [], 'openQuestions': [],
+                'sourceMessageIds': ['uca', 'correction'],
+                'memoryVersions': [{'id': 'pref_old', 'version': 1}, {'id': 'pref_new', 'version': 1}]}
+
+    def test_summary_cannot_reintroduce_retired_preference_and_cause_false_stale(self):
+        self.preference_summary()
+        before = self.child_state()
+        result, contexts = self.ask(self.response(sources=['correction', 'pref_new']),
+            text='孩子刚才聊了什么、哪里没懂、希望怎么讲？')
+        self.assertEqual(result['lastRequest']['status'], 'completed')
+        self.assertEqual([p for p, _ in contexts], ['parent_select', 'parent_answer'])
+        evidence = {e['id']: e for e in contexts[-1][1]['evidence']}
+        self.assertNotIn('pref_old', evidence)
+        self.assertIn('pref_new', evidence)
+        self.assertIn('uca', evidence)  # historical quote remains inspectable
+        self.assertIn('correction', evidence)
+        self.assertEqual(len(contexts[-1][1]['summaries']), 1)
+        self.assertFalse(result['messages'][-1]['stale'])
+        self.assertEqual(self.child_state(), before)
+
+    def test_unrelated_updates_and_summary_refresh_do_not_reject_selected_sources(self):
+        self.preference_summary()
+        unrelated = self.s.add_reminder({'childId': self.a, 'summary': '无关话题提醒'})
+        for stage in ('parent_select', 'parent_answer'):
+            with self.subTest(stage=stage):
+                entered, release = threading.Event(), threading.Event()
+                def model(context, rid, purpose='chat'):
+                    if purpose == stage:
+                        entered.set()
+                        self.assertTrue(release.wait(3))
+                    return (self.selector() if purpose == 'parent_select' else
+                            self.response(sources=['correction', 'pref_new'])), {}
+                rid = 'unrelated_update_' + stage
+                with patch.object(self.s.model, 'complete', side_effect=model):
+                    self.s.parent.begin({'childId': self.a, 'requestId': rid, 'text': '刚才聊了什么？'})
+                    self.assertTrue(entered.wait(1))
+                    try:
+                        self.s.update_memory(unrelated['id'], {'childId': self.a, 'summary': '仍是无关提醒'})
+                        with self.s.store.transaction() as db:
+                            exp = db['conversations']['ca']['exploration']
+                            exp.update(version=exp['version'] + 1, fingerprint='refreshed-' + stage)
+                            db['conversations']['ca']['title'] = '刷新后的小结标题'
+                    finally:
+                        release.set()
+                    result = self.wait_parent(rid)
+                self.assertEqual(result['status'], 'completed')
+
+    def wait_parent(self, rid):
+        for _ in range(200):
+            result = self.s.store.read()['parentRequests'][rid]
+            if result['status'] != 'pending':
+                return result
+            time.sleep(.005)
+        self.fail('parent request did not finish')
+
+    def test_referenced_record_edit_or_withdrawal_still_rejects_inflight_answer(self):
+        for stage in ('parent_select', 'parent_answer'):
+            for action in ('edit', 'withdraw', 'delete'):
+                with self.subTest(stage=stage, action=action):
+                    mid = 'evidence_' + stage + '_' + action
+                    source_id = 'source_' + mid
+                    item = {'id': mid, 'childId': self.a, 'type': 'dialogue_memory',
+                        'kind': 'preference', 'status': 'observed', 'scope': 'general', 'version': 1,
+                        'summary': '喜欢用身边物品举例', 'quote': '我喜欢用身边物品举例',
+                        'scopeEvidence': '我喜欢用身边物品举例', 'evidenceBasis': 'independent_expression',
+                        'sourceMessageIds': [source_id], 'updatedAt': stamp()}
+                    with self.s.store.transaction() as db:
+                        db['messages'][source_id] = {**db['messages']['uca'], 'id': source_id, 'text': item['quote']}
+                        db['memoryItems'][mid] = item
+                    entered, release = threading.Event(), threading.Event()
+                    calls = []
+                    def model(context, rid, purpose='chat'):
+                        calls.append(purpose)
+                        if purpose == stage:
+                            entered.set()
+                            self.assertTrue(release.wait(3))
+                        return (self.selector(memoryIds=[item['id']], conversationIds=[]) if purpose == 'parent_select' else
+                                self.response(sources=[item['id'], source_id])), {}
+                    rid = 'true_conflict_' + stage + '_' + action
+                    with patch.object(self.s.model, 'complete', side_effect=model):
+                        self.s.parent.begin({'childId': self.a, 'requestId': rid, 'text': '这条提醒的依据是什么？'})
+                        self.assertTrue(entered.wait(1))
+                        try:
+                            self.s.update_memory(item['id'], {'childId': self.a, 'action': action,
+                                'summary': '修改后的提醒', 'expectedVersion': 1})
+                        finally:
+                            release.set()
+                        result = self.wait_parent(rid)
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertEqual(result['error'], '依据刚有更新，请重新提问。')
+                    self.assertEqual(calls, ['parent_select'] if stage == 'parent_select' else ['parent_select', 'parent_answer'])
+                    self.assertFalse(any(m['role'] == 'assistant' and m.get('requestId') == rid
+                                         for m in self.s.store.read()['parentMessages'].values()))
+
+    def test_answer_prose_projects_structured_fields_on_write_and_historical_read(self):
+        draft = {'action': 'add', 'memoryId': '', 'summary': '用身边物品说明', 'topic': '大小', 'scope': 'topic'}
+        leaked = ('草稿待你确认后保存。\n\naction: add\nmemoryId: 空\n'
+                  'summary: 用身边物品说明\ntopic: 大小\nscope: topic\n\n也可以继续修改。')
+        result, _ = self.ask(self.response(answer=leaked, draft=draft))
+        mid = result['messages'][-1]['id']
+        self.assertEqual(result['lastRequest']['status'], 'completed')
+        expected = '草稿待你确认后保存。\n也可以继续修改。'
+        self.assertEqual(result['messages'][-1]['text'], expected)
+        self.assertEqual(result['messages'][-1]['draft']['summary'], draft['summary'])
+        self.assertEqual(self.s.store.read()['parentMessages'][mid]['text'], expected)
+        with self.s.store.transaction() as db:
+            db['parentMessages'][mid]['text'] = leaked
+        before = self.s.store.read()
+        with patch.object(self.s.model, 'complete', side_effect=AssertionError('projection called provider')):
+            self.assertEqual(self.s.parent.snapshot(self.a)['messages'][-1]['text'], expected)
+        self.assertEqual(self.s.store.read(), before)
+
+    def test_parent_prose_uses_schema_fields_not_example_specific_words(self):
+        import json
+        prose = '原话只说明当时的提问。'
+        structured = {'answer': prose, 'advice': None, 'sources': ['internal_source'],
+                      'draft': {'action': 'add', 'summary': '内部草稿', 'scope': 'topic'}}
+        for raw in [json.dumps(structured, ensure_ascii=False),
+                    '```json\n' + json.dumps(structured, ensure_ascii=False, indent=2) + '\n```',
+                    prose + '\nusedEvidenceIds: [\n  "internal_source"\n]\n**scope**: topic',
+                    prose + '\n```json\n"draft": {\n"summary": "内部草稿",\n"scope": "topic"\n}\n```']:
+            with self.subTest(raw=raw):
+                self.assertEqual(clean_parent_prose(raw, 'answer', 4000), prose)
+        for text in ['好。', 'Tip: try a different example.', '孩子问了“scope是什么意思”。']:
+            self.assertEqual(clean_parent_prose(text, 'answer', 4000), text)
+        self.assertEqual(clean_parent_prose('以下是回复。\n' + json.dumps(structured, ensure_ascii=False), 'answer', 4000),
+                         '以下是回复。\n' + prose)
+
 
     def test_network_does_not_hold_store_lock_and_cancellation_discards_late_result(self):
         entered, release = threading.Event(), threading.Event()
