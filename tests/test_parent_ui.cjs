@@ -23,6 +23,20 @@ function page(){
  return {c,store,sent,run:s=>vm.runInContext(s,c)};
 }
 
+test('parent activity keeps its origin even when the child suggestion is newer',()=>{
+ const p=page();
+ p.run(`state.data.suggestion={title:'孩子侧的新建议',steps:'孩子侧步骤',createdAt:'2026-10-03T13:39:54'};parentView().loadedAt=Date.now();parentView().data={activity:{title:'家长侧活动',materials:'纸',steps:'一起画',adultAction:'家长陪同',createdAt:'2026-10-03T13:16:56',url:'/parent?view=ask#parent-a'}};`);
+ let html=p.run('recentActivity()');
+ assert.match(html,/家长侧活动/);
+ assert.ok(!html.includes('孩子侧的新建议')&&!html.includes('孩子侧步骤'));
+ p.run('parentView().data.activity=null');
+ html=p.run('recentActivity()');
+ assert.ok(!html.includes('parent-activity')&&!html.includes('孩子侧步骤'));
+ assert.match(html,/想一个一起做的小活动/);
+ assert.equal(p.c.state.data.suggestion.title,'孩子侧的新建议');
+ assert.equal(p.sent.length,0);
+});
+
 test('uncertain request A does not follow the same question to record B',async()=>{
  const p=page();
  await p.run("parentSend('同一问题')");

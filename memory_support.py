@@ -34,7 +34,7 @@ RECALL_PROMPT = """为儿童对话选择确实有用的历史资料，只返回I
 按语义判断当前描述是否已经足够。最近对话能解释指代时不另取旧会话；需要旧交流才选择会话。明确要回忆但目录找不到时返回exploration和空会话列表，不猜测对象。
 回顾探索经过、上次聊到哪里用exploration；核对过去原话用quotes，最多选2个会话。
 memoryIds最多4条，可以为空；不要因家长修改过、记录新或共有泛泛的词就选取。
-general是一般讲法，topic仅在该话题相关时使用，conversation只适用当前会话。
+general是跨会话个人偏好或一般讲法，仍只在语义相关时选取；topic仅在该话题相关时使用，conversation只适用当前会话。
 理解/困惑只代表那次表达。新理解不证明旧困惑从未发生。具体本次讲法优先于一般偏好。
 同一内容优先最新有效修订；矛盾不明确时保留必要双方，不假装已经解决。
 家长提醒影响讲法，不是公共科学事实。完全不相关就返回空列表，不为填满数量挑选。
@@ -87,6 +87,23 @@ def effective_scope(item):
 
 def reference(item):
     return {"id": item["id"], "version": version(item)}
+
+
+def superseded_preferences(db, child_id):
+    """Accepted corrections retire a particular version, not its source evidence.
+
+    Withdrawing a correction does not silently revive a preference the child
+    already corrected. A later parent revision of the old record is a new version.
+    """
+    retired = {}
+    for newer in db["memoryItems"].values():
+        if newer.get("childId") != child_id or newer.get("kind") != "preference":
+            continue
+        for ref in newer.get("supersedes", []):
+            old = db["memoryItems"].get(ref.get("id"), {})
+            if old.get("childId") == child_id and old.get("kind") == "preference" and version(old) == ref.get("version"):
+                retired[old["id"]] = newer["id"]
+    return retired
 
 
 def dependencies_valid(db, refs, child_id):

@@ -13,7 +13,7 @@ import calendar
 from zoneinfo import ZoneInfo
 
 from memory_support import (active, validity, version, reference, dependencies_valid,
-                            exploration_valid, exploration_view, memory_view)
+                            exploration_valid, exploration_view, memory_view, superseded_preferences)
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -86,7 +86,9 @@ class ParentService:
 
     def valid_result(self, db, result, child_id):
         blocked, _ = validity(db, child_id)
-        return (dependencies_valid(db, result.get("memoryVersions", []), child_id)
+        superseded = superseded_preferences(db, child_id)
+        return (not any(r.get("id") in superseded for r in result.get("memoryVersions", []))
+                and dependencies_valid(db, result.get("memoryVersions", []), child_id)
                 and all((m := db["messages"].get(mid, {})).get("childId") == child_id
                         and mid not in blocked and not m.get("deleted")
                         and not db["conversations"].get(m.get("conversationId"), {}).get("deleted")
@@ -274,7 +276,8 @@ class ParentService:
         db = self.store.read()
         profile = self.service.profile(db, child_id)
         blocked, invalid = validity(db, child_id)
-        records = sorted((m for m in db["memoryItems"].values() if m["id"] not in invalid and active(m, child_id, m.get("conversationId"))), key=lambda m: m.get("updatedAt", ""), reverse=True)
+        superseded = superseded_preferences(db, child_id)
+        records = sorted((m for m in db["memoryItems"].values() if m["id"] not in invalid and m["id"] not in superseded and active(m, child_id, m.get("conversationId"))), key=lambda m: m.get("updatedAt", ""), reverse=True)
         conversations = sorted((c for c in db["conversations"].values() if c.get("childId") == child_id and not c.get("deleted")), key=lambda c: c["startedAt"], reverse=True)
         raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
         history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
