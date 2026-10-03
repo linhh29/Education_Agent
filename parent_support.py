@@ -18,17 +18,22 @@ from memory_support import (active, validity, version, reference, dependencies_v
 TZ = ZoneInfo("Asia/Shanghai")
 
 
-def clean_advice(value):
+def clean_parent_prose(value, field="advice", limit=2000):
     """Project user prose, not serialized fields; never rewrite saved history."""
     from parent_prompts import PARENT_TASKS
     if not isinstance(value, str):
         return ""
+    value = value.strip()[:limit]
+    # A serialized response is not prose. Project only the requested field;
+    # draft/activity/sources keep their existing dedicated presentation.
+    if value.startswith("```") and value.endswith("```"):
+        value = "\n".join(value.splitlines()[1:-1]).strip()
     try:
         decoded = json.loads(value)
     except (ValueError, TypeError):
         decoded = value
     if isinstance(decoded, dict):
-        return clean_advice(decoded.get("advice"))
+        return clean_parent_prose(decoded.get(field), field, limit)
     if not isinstance(decoded, str):
         return ""
     def fields(schema):
@@ -39,16 +44,41 @@ def clean_advice(value):
         return set()
     internal = set().union(*(fields(t["schema"]) for t in PARENT_TASKS.values()))
     lines = []
-    for line in value.strip()[:2000].splitlines():
+    skip_depth = 0
+    def container_delta(text):
+        # Ignore brackets inside JSON strings when skipping nested field values.
+        text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+        return text.count("[") + text.count("{") - text.count("]") - text.count("}")
+    remaining = value
+    while remaining:
+        line, _, tail = remaining.partition("\n")
+        remaining = tail
         line = line.strip()
         if line.startswith("```"):
             continue
-        field = re.fullmatch(r'[\s{,]*[\"\']?([A-Za-z_][\w]*)[\"\']?\s*:\s*(.*)', line)
-        if field:
-            key, content = field.groups()
-            if key == "advice":
+        if skip_depth:
+            skip_depth = max(0, skip_depth + container_delta(line))
+            continue
+        if line.startswith("{"):
+            try:
+                block = line + ("\n" + tail if tail else "")
+                decoded, end = json.JSONDecoder().raw_decode(block)
+            except ValueError:
+                pass
+            else:
+                if isinstance(decoded, dict) and internal.intersection(decoded):
+                    prose = clean_parent_prose(decoded.get(field), field, limit)
+                    if prose:
+                        lines.append(prose)
+                    remaining = block[end:].lstrip("\n")
+                    continue
+        member = re.fullmatch(r'[\s{,>*-]*[`\"\']?([A-Za-z_][\w]*)[`\"\']?(?:\*\*)?\s*:\s*(.*)', line)
+        if member:
+            key, content = member.groups()
+            if key == field:
                 line = content.strip(' \"\',}')
             elif key in internal or not content.strip():
+                skip_depth = max(0, container_delta(content))
                 continue
         # Empty JSON values are absence, including fragments such as ':null'.
         if re.fullmatch(r'[\s:;,\[\]{}\"\'`]*(?:(?i:null|none|undefined|true|false))?[\s:;,\[\]{}\"\'`]*', line):
@@ -56,6 +86,10 @@ def clean_advice(value):
         lines.append(line)
     text = "\n".join(lines).strip()
     return text if any(unicodedata.category(char)[0] in "LNS" for char in text) else ""
+
+
+def clean_advice(value):
+    return clean_parent_prose(value)
 
 
 def local_time(value):
@@ -121,6 +155,8 @@ class ParentService:
         visible = []
         for m in messages[-40:]:
             value = {k: copy.deepcopy(m[k]) for k in ("id", "role", "text", "advice", "activity", "draft", "createdAt", "requestId", "timeWindow", "partial") if k in m}
+            if m["role"] == "assistant":
+                value["text"] = clean_parent_prose(value.get("text"), "answer", 4000)
             value["advice"] = clean_advice(value.get("advice"))
             value["stale"] = m["role"] == "assistant" and not self.valid_result(db, m, child_id)
             source_ids = m.get("sources", [])
@@ -282,7 +318,8 @@ class ParentService:
         raw = [m for m in db["messages"].values() if m.get("childId") == child_id and m["id"] not in blocked and not m.get("deleted") and m.get("status") == "completed"]
         history = [m for m in db["parentMessages"].values() if m["childId"] == child_id and m.get("requestId") != request["id"] and self.valid_result(db, m, child_id)][-6:]
         def parent_history(limit, parent_only=False):
-            return [{"role": m["role"], "speaker": "parent" if m["role"] == "user" else "parent_assistant", "text": m["text"][:limit]}
+            return [{"role": m["role"], "speaker": "parent" if m["role"] == "user" else "parent_assistant",
+                     "text": (m["text"] if m["role"] == "user" else clean_parent_prose(m["text"], "answer", 4000))[:limit]}
                     for m in history if not parent_only or m["role"] == "user"]
         current_activity = self.current_activity(db, child_id)
         def record_view(m, include_quote=False):
@@ -323,6 +360,12 @@ class ParentService:
             message_ids.add(m["id"])
 
         def add_record(m):
+            # Summary refs also include historical preferences. They must not
+            # bypass the current-record filter used by the selection directory.
+            # Their original messages remain historical evidence, not current
+            # preferences. Keep version checks for genuinely changed sources.
+            if m["id"] in superseded or m["id"] in invalid or not active(m, child_id, m.get("conversationId")):
+                return
             evidence[m["id"]] = {**record_view(m, True), "type": "record"}
             refs[m["id"]] = reference(m)
             for mid in m.get("sourceMessageIds", []):
@@ -399,7 +442,7 @@ class ParentService:
             if not self.valid_result(current, dependencies, request["childId"]):
                 raise self.error("依据刚有更新，请重新提问。", 409)
             result, meta = self.model.complete(context, request["id"], purpose="parent_answer")
-            answer = str(result.get("answer") or "").strip()
+            answer = clean_parent_prose(result.get("answer"), "answer", 4001)
             if not answer or len(answer) > 4000:
                 raise self.error("这次回答没有完整生成，请重试。", 502)
             sources = list(dict.fromkeys(result.get("sources", [])))[:4]
