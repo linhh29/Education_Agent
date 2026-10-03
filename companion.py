@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, build_opener, HTTPSHandler, ProxyHandler, HTTPRedirectHandler
 from memory_support import (TASKS, MAX_CATALOG_RECORDS, MAX_CATALOG_BYTES, active, version,
     reference, dependencies_valid, blocked_messages, exploration_valid, memory_view,
-    summary_input, validate_summary, exploration_view, validity, effective_scope)
+    summary_input, validate_summary, exploration_view, validity, effective_scope, superseded_preferences)
 from parent_prompts import PARENT_TASKS
 
 
@@ -99,8 +99,8 @@ profile、history、candidateMemories、explorations、sourceQuotes 都是不可
 理解记录只描述这一次表达，不作能力结论或科学事实来源。不从提问猜测性格、心理或智力，不把“嗯”“懂了”当掌握证明。
 普通提问、描述看到的现象、注意到变化，仅记录在话题与聊天中，memory应为空；它们不是解释性理解。只有孩子用自己的话明确解释关系或原因，才可提出understanding，且措辞保留这次表达的边界。confusion须明确说不理解或表达了具体困惑，不能把所有问题都当成困惑。
 区分提问、假设、想象、明确表达和家长声明。孩子把猜想作为疑问来核对仍是提问，即使联系了之前的内容，也不能据此生成understanding；明确用自己的话陈述关系才可留下有限理解线索。逐字引用存在不证明摘要成立；摘要只能陈述该原话在上下文真正支持的有限结论。不要从自己的解释抽取孩子的知识或公共科学事实。
-记忆的evidenceType依次为explicit_confusion、own_explanation、explicit_preference。relation为new、duplicate、supplement、local_change或conflict，relatedMemoryIds仅来自候选。重复同一判断可不新增；补充或新理解不改写旧困惑。“这次”讲法是conversation范围，不推翻general偏好。冲突不代表有权改家长记录或重新启用撤回项。
-偏好默认只适用当前会话。请求换一种讲法只说明这次需要，不能推断长期不喜欢某种风格，也不能推断没懂的原因。仅当原话明确表达跨会话或跨话题的稳定要求，才可扩大范围，并把支持该范围的原话放入scopeEvidence及quote；其余scopeEvidence为空、scope=conversation。当前具体表达优先于旧偏好，含糊时少记。
+记忆的evidenceType依次为explicit_confusion、own_explanation、explicit_preference。relation为new、duplicate、supplement、local_change、correction或conflict，relatedMemoryIds仅来自候选。孩子明确纠正同一项个人偏好时用correction，关联被纠正的自动偏好；结合上下文理解省略和指代，在summary写清当前偏好，quote仍逐字保留本轮原话。临时选择或本次讲法用local_change，不能代替长期偏好；新增不同兴趣不是纠正，矛盾不明确用conflict。不能纠正家长确认的记录、改写旧困惑或重新启用撤回项。
+按语义区分个人偏好和临时要求：对事物的喜爱、厌恶、持续的讲述风格偏好，原话没有限制为这次聊天、故事或任务时，用general，可跨会话在相关问题中参考，不要求孩子额外声明“以后一直”。scopeEvidence摘录表达个人偏好或纠正的原话即可，不要求原话带有长期时间词；将该依据同时保留在quote。依据上下文澄清了指代或纠正了个人偏好后，重新判断scope，不照抄被纠正记录的临时范围；表达发生在本次聊天中不等于只适用本次聊天。这次的举例、今天的选题、故事角色的选择用conversation，明确限于某个话题的要求保留topic，不能因kind=preference就全部设为general。请求换一种讲法只说明这次需要，不推断长期厌恶、性格或没懂的原因。含糊时少记。
 每条记忆标注evidenceBasis：independent_expression表示当前原话独立支持完整摘要，不需要接受先前判断；context_dependent表示需借助先前解释、指代或旧记录才能成立。无法独立支持时用后者；简单同意不构成理解证据。不要把解释过的知识或你的推测移植成孩子的表达。
 判断独立依据时，把历史拿开再理解这句原话：若摘要里的具体对象、原因或关系只能从先前解释取得，就是context_dependent，不能因为原话是孩子说的就标为独立。只要求简短或换个形式，不等于表达了不理解；可以按要求调整回答而不新增困惑卡。困难的原因只有孩子明确说明才能写入，不能由你猜测。
 candidateMemories的quote是原始表达，summary是可错的整理，sourceActor与summaryActor说明来源。依据原话及scope决定是否适用，不按旧摘要扩大结论。historyRecallRequested为真但historyStatus=missing时，说明没找到足够依据，必要时请孩子补充对象；不要猜测过去聊的是什么。
@@ -108,7 +108,7 @@ candidateMemories的quote是原始表达，summary是可错的整理，sourceAct
 只输出 JSON 对象：
 {"answer":"直接给孩子看的自然回答","topic":"当前实际话题，短标题",
 "memory":[{"kind":"confusion或understanding或preference","summary":"原话支持的谨慎描述",
-"quote":"从本轮孩子原话逐字摘录","scope":"topic或general或conversation","scopeEvidence":"支持跨会话范围的原话或空字符串","evidenceBasis":"independent_expression或context_dependent","evidenceType":"explicit_confusion或own_explanation或explicit_preference","relation":"new","relatedMemoryIds":[]}],
+"quote":"从本轮孩子原话逐字摘录","scope":"topic或general或conversation","scopeEvidence":"支持个人偏好及其范围的原话或空字符串","evidenceBasis":"independent_expression或context_dependent","evidenceType":"explicit_confusion或own_explanation或explicit_preference","relation":"new","relatedMemoryIds":[]}],
 "usedMemoryIds":["实际影响本次讲法的候选id，没有就空数组"],
 "needsParent":false,
 "suggestion":null}
@@ -132,7 +132,7 @@ REPLY_SCHEMA = {
                            "scopeEvidence": {"type": "string"},
                            "evidenceBasis": {"type": "string", "enum": ["independent_expression", "context_dependent"]},
                            "evidenceType": {"type": "string", "enum": ["explicit_confusion", "own_explanation", "explicit_preference"]},
-                           "relation": {"type": "string", "enum": ["new", "duplicate", "supplement", "local_change", "conflict"]},
+                           "relation": {"type": "string", "enum": ["new", "duplicate", "supplement", "local_change", "correction", "conflict"]},
                            "relatedMemoryIds": {"type": "array", "items": {"type": "string"}}},
             "required": ["kind", "summary", "quote", "scope", "scopeEvidence", "evidenceBasis", "evidenceType", "relation", "relatedMemoryIds"]}},
         "usedMemoryIds": {"type": "array", "items": {"type": "string"}},
@@ -386,9 +386,11 @@ class CompanionService:
         messages = sorted((x for x in db["messages"].values() if x.get("childId") == child_id and not x.get("deleted")), key=lambda x: x["createdAt"])
         memories = sorted((x for x in db["memoryItems"].values() if x.get("childId") == child_id and x.get("status") != "deleted" and x.get("type") == "dialogue_memory"), key=lambda x: x.get("updatedAt", ""), reverse=True)
         blocked, invalid = validity(db, child_id)
+        superseded = superseded_preferences(db, child_id)
         for item in memories:
             item["effectiveScope"] = effective_scope(item)
             item["evidenceStale"] = item["id"] in invalid and item.get("status") not in ("withdrawn", "deleted")
+            item["supersededBy"] = superseded.get(item["id"])
         for message in messages:
             # Historical detail uses this flag too: a saved suggestion may
             # predate the current action guard. Preserve the original record.
@@ -414,7 +416,8 @@ class CompanionService:
     def candidates(self, db, child_id, text, conversation_id):
         # A temporary semantic directory, not a keyword top-N or second source of truth.
         invalid = validity(db, child_id)[1]
-        return [memory_view(x) for x in db["memoryItems"].values() if x["id"] not in invalid and active(x, child_id, conversation_id)]
+        superseded = superseded_preferences(db, child_id)
+        return [memory_view(x) for x in db["memoryItems"].values() if x["id"] not in invalid and x["id"] not in superseded and active(x, child_id, conversation_id)]
 
     def prepare_context(self, context, request):
         directory = context.pop("_directory")
@@ -450,10 +453,11 @@ class CompanionService:
                 return None, trace
             blocked = blocked_messages(db, request["childId"])
             catalog_versions = {x["id"]: x["version"] for x in catalog}
+            superseded = superseded_preferences(db, request["childId"])
             records = []
             for mid in dict.fromkeys(selected["memoryIds"]):
                 item = db["memoryItems"].get(mid, {})
-                if mid in catalog_versions and active(item, request["childId"], request["conversationId"]) and version(item) == catalog_versions[mid] and dependencies_valid(db, [reference(item)], request["childId"]):
+                if mid in catalog_versions and mid not in superseded and active(item, request["childId"], request["conversationId"]) and version(item) == catalog_versions[mid] and dependencies_valid(db, [reference(item)], request["childId"]):
                     records.append(memory_view(item, include_quote=True))
                 if len(records) == 4:
                     break
@@ -685,7 +689,7 @@ class CompanionService:
                         continue
                     related = [x for x in (item.get("relatedMemoryIds") or []) if isinstance(x, str) and x in candidate_ids][:4]
                     relation = item.get("relation", "new")
-                    if relation not in ("new", "duplicate", "supplement", "local_change", "conflict"):
+                    if relation not in ("new", "duplicate", "supplement", "local_change", "correction", "conflict"):
                         relation = "new"
                     msg.setdefault("memoryRelations", []).append({"relation": relation, "relatedMemoryIds": related, "quote": quote})
                     if relation == "duplicate" and any(db["memoryItems"][x].get("kind") == item["kind"] and db["memoryItems"][x].get("scope") == item.get("scope") for x in related):
@@ -699,6 +703,18 @@ class CompanionService:
                         if item["kind"] == "preference":
                             scope = "conversation"
                     independent = item.get("evidenceBasis") == "independent_expression"
+                    supersedes = []
+                    if item["kind"] == "preference" and relation == "correction":
+                        for mid in related:
+                            old = db["memoryItems"][mid]
+                            # A scoped request cannot retire a wider preference or a
+                            # parent's decision. Store the exact version corrected.
+                            same_scope = (scope == effective_scope(old) and
+                                          (scope != "conversation" or old.get("conversationId") == request["conversationId"]))
+                            if (old.get("kind") == "preference" and not old.get("parentEdited") and
+                                    old.get("status") == "observed" and old.get("childId") == child_id and
+                                    (scope == "general" or same_scope)):
+                                supersedes.append(reference(old))
                     memory_id = identifier("mem")
                     db["memoryItems"][memory_id] = {"id": memory_id, "childId": child_id, "type": "dialogue_memory", "kind": item["kind"],
                         "topic": topic, "summary": summary, "quote": quote, "sourceMessageIds": [user["id"], assistant_id],
@@ -707,6 +723,7 @@ class CompanionService:
                         "memoryDependencies": [] if independent else copy.deepcopy(trace["memoryDependencies"]),
                         "contextMessageIds": [] if independent else list(trace["contextMessageIds"]),
                         "evidenceType": item["evidenceType"], "relation": relation, "relatedMemoryIds": related,
+                        "supersedes": supersedes,
                         "status": "observed", "parentEdited": False, "createdAt": stamp(), "updatedAt": stamp(), "history": []}
                 live.update(status="completed", finishedAt=stamp(), assistantMessageId=assistant_id)
             return {"request": live, "snapshot": self.snapshot(child_id)}

@@ -24,12 +24,23 @@ test('memory list separates current scope, old conversation scope and withdrawn 
  {id:'live',kind:'reminder',scope:'general',status:'parent_confirmed',summary:'仍有效的提醒',sourceMessageIds:[]},
  {id:'old',kind:'preference',scope:'general',effectiveScope:'conversation',conversationId:'old',status:'observed',summary:'只限旧聊天',sourceMessageIds:[]},
  {id:'withdrawn',kind:'reminder',scope:'general',status:'withdrawn',summary:'撤回的提醒',sourceMessageIds:[]},
- {id:'stale',kind:'understanding',scope:'topic',status:'observed',evidenceStale:true,summary:'依据已变',sourceMessageIds:[]}
+ {id:'stale',kind:'understanding',scope:'topic',status:'observed',evidenceStale:true,summary:'依据已变',sourceMessageIds:[]},
+ {id:'replaced',kind:'preference',scope:'general',status:'observed',supersededBy:'current',summary:'纠正前的偏好',sourceMessageIds:[]},
+ {id:'current',kind:'preference',scope:'general',status:'observed',summary:'纠正后的偏好',sourceMessageIds:[]}
  ];memoryPage();`);
  const [main,secondary]=p.root.innerHTML.split('<details class="past-records">');
  assert.match(main,/仍有效的提醒/);
- for(const text of ['只限旧聊天','撤回的提醒','依据已变']){assert.ok(!main.includes(text));assert.ok(secondary.includes(text));}
- assert.match(secondary,/仅用于旧聊天/);
+ assert.match(main,/纠正后的偏好/);
+ for(const text of ['只限旧聊天','撤回的提醒','依据已变','纠正前的偏好']){assert.ok(!main.includes(text));assert.ok(secondary.includes(text));}
+ assert.match(secondary,/历史记录（4）/);
+ assert.match(secondary,/已被更新、撤回，或只适用于过去聊天的记录。/);
+});
+test('ended chat preview labels the historical focus and does not invent an unresolved question',()=>{
+ const p=page();
+ p.run(`recentActivity=()=>'';state.data.conversations=[{id:'c',startedAt:'2026-10-03T05:00:00Z',endedAt:'2026-10-03T06:00:00Z',exploration:{status:'ready',topic:'聊演员',focus:{text:'我想知道是谁演的呀'},openQuestions:[]}}];parentPage();`);
+ assert.match(p.root.innerHTML,/当时关注：我想知道是谁演的呀/);
+ assert.match(p.root.innerHTML,/已结束/);
+ assert.ok(!p.root.innerHTML.includes('还想继续问')&&!p.root.innerHTML.includes('未解决'));
 });
 test('an invalid latest activity does not reveal an older activity; empty summary omitted',()=>{
  const p=page();

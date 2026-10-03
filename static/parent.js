@@ -17,9 +17,8 @@ function parentActivity(activity,standalone=false){
  return `<section class="${standalone?'panel ':''}parent-activity"><h2>${esc(activity.title)}</h2><dl><dt>需要什么</dt><dd>${esc(activity.materials)}</dd><dt>一起做</dt><dd>${esc(activity.steps)}</dd><dt>大人来做</dt><dd>${esc(activity.adultAction)}</dd></dl>${activity.why?`<p class="muted">${esc(activity.why)}</p>`:''}${standalone?`<a href="${esc(activity.url)}">查看建议与依据</a>`:''}</section>`;
 }
 function recentActivity(){
- const v=ensureParent(),p=v.data?.activity,c=state.data.suggestion;
- if(p&&(!c||p.createdAt>c.createdAt))return `<div class="recent-activity"><p class="eyebrow">一起观察</p>${parentActivity(p,true)}</div>`;
- if(c)return `<section class="panel parent-activity"><p class="eyebrow">一起观察</p><h2>${esc(c.title)}</h2><p class="suggestion-steps">${esc(c.steps)}</p>${c.why?`<p class="muted">${esc(c.why)}</p>`:''}<a href="/memory?conversation=${encodeURIComponent(c.conversationId)}">查看这次聊天</a></section>`;
+ const p=ensureParent().data?.activity;
+ if(p)return `<div class="recent-activity"><p class="eyebrow">一起观察</p>${parentActivity(p,true)}</div>`;
  return `<p class="activity-entry"><a href="/parent?view=ask&activity=1">想一个一起做的小活动 →</a></p>`;
 }
 function parentDraft(message){
